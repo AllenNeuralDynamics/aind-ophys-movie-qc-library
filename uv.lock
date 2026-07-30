@@ -28,7 +28,7 @@ wheels = [
 
 [[package]]
 name = "aind-ophys-movie-qc-library"
-version = "0.0.0"
+version = "0.1.0"
 source = { editable = "." }
 
 [package.dev-dependencies]
