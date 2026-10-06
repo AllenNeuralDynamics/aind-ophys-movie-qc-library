@@ -1,118 +1,86 @@
-# -*- coding: utf-8 -*-
-import os
-import numpy as np
+"""Local z-stack registration and z-drift measurement.
+
+The constructor takes an already-resolved ``fov_scale_factor`` rather than
+reading acquisition metadata itself.
+
+Coverage-omitted: every method needs a real z-stack HDF5.
+"""
+
+import json
+import logging
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple, Union
+
 import h5py
+import numpy as np
 import scipy.ndimage
 from skimage.metrics import structural_similarity as ssim
 from skimage.registration import phase_cross_correlation
-import matplotlib.pyplot as plt
-import json
-from pathlib import Path
+
+logger = logging.getLogger("Ophys movie QC")
+
+LOCAL_ZSTACK_GLOB = "{unique_id}_z_stack_local.h5"
 
 
 class LocalZStack:
-    """Local Z Stack
+    """Local z-stack QC metrics.
 
-    Objects contain methods to generate QC metrics from the local z stack files
-    captured at the Allen Institute.  These files are typically named '*_zstack_local.h5'
-    or '*_zstack_local_dewarping.h5', depending on the rig.
+    Generates QC metrics from the local z-stack files captured at the Allen
+    Institute, named ``<unique_id>_z_stack_local.h5`` (see
+    :data:`LOCAL_ZSTACK_GLOB`).
 
-    Args:
-        zstack_filepath:  The path to the local z stack file
-        physio_filepath:  The path to the physio movie to use in calculating z-drift
-        session_json_path:  The path to the session json file containing metadata about the session
+    Parameters
+    ----------
+    zstack_filepath : path-like
+        The path to the local z-stack file.
+    physio_filepath : path-like
+        The path to the physio movie used in calculating z-drift.
+    fov_scale_factor : float, optional
+        Micrometres per pixel, already resolved from the acquisition
+        metadata. Recorded in ``meta`` as provenance; ``None`` when the
+        metadata does not carry it.
 
-    Attributes:
-        ophys_experiment:  A LimsOphysExperiment object associated with this video
-        data_pointer:  A reference to the HDF5 file of interest
-        meta: A LocalZStackMeta object corresponding to the metadata of this video
-        _cache:  A cache that stores previously subsampled and cropped videos
-        dataset_name:  A string used to refer to this QC set
-        metrics:  A dict of parameters to save in the Mouse-Seeks database
-        images:  A dict of image locations to save in the Mouse-Seeks database
-        _physio_filepath:  The path to the physio movie to use in calculating z-drift
+    Attributes
+    ----------
+    meta : dict
+        Metadata read from the z-stack's ScanImage header.
+    zstack : numpy.ndarray
+        Loop-averaged z-stack of shape ``(nb_of_planes, Y, X)``.
     """
 
-    def __init__(self, zstack_filepath, physio_filepath, session_json_path):
+    def __init__(
+        self,
+        zstack_filepath: Union[str, Path],
+        physio_filepath: Union[str, Path],
+        fov_scale_factor: Optional[float] = None,
+    ) -> None:
+        """Read the z-stack metadata and build the loop-averaged stack."""
         self.zstack_filepath = zstack_filepath
         self.physio_filepath = physio_filepath
-        self.session_json_path = session_json_path
+        self.fov_scale_factor = fov_scale_factor
 
         self.meta = {}
         self.local_zstack_metadata()
         self.zstack = self.process_stack()
 
-        self.images = {}
-        self.dataset_name = "local_z_stack"
+    def process_stack(self) -> np.ndarray:
+        """Average common z-planes across loops.
 
-    def _calculate_qc_metrics(self):
-        """Calculates QC metrics and saves to the parameter self.metrics
-
-        Returns:
-            None
-        """
-        z_drift_corr, _ = self.get_z_drift(gaussian_filter=True, metric="corr")
-        self.metrics = {
-            "shape": self.meta["data_shape"],
-            "z_drift_corr_start_frame": z_drift_corr["start_frame"],
-            "z_drift_corr_end_frame": z_drift_corr["end_frame"],
-            "z_drift_corr_frame_diff": z_drift_corr["end_frame"]
-            - z_drift_corr["start_frame"],
-            "z_drift_corr_um_diff": (
-                z_drift_corr["end_frame"] - z_drift_corr["start_frame"]
-            )
-            * self.meta["z_spacing_um"],
-            "z_drift_start_frame_match_method": "algorithm",
-            "z_drift_end_frame_match_method": "algorithm",
-            "filepath": self.physio_filepath,
-        }
-        if "start_frame_corr" in z_drift_corr:
-            self.metrics["start_frame_corr"] = z_drift_corr["start_frame_corr"]
-            self.metrics["end_frame_corr"] = z_drift_corr["end_frame_corr"]
-        elif "start_frame_ssim" in z_drift_corr:
-            self.metrics["start_frame_ssim"] = z_drift_corr["start_frame_ssim"]
-            self.metrics["end_frame_ssim"] = z_drift_corr["end_frame_ssim"]
-
-        try:
-            z_drift_ssim, _ = self.get_z_drift(
-                gaussian_filter=True, sigma=5, metric="ssim"
-            )
-            self.metrics.update(
-                {
-                    "z_drift_ssim_start_frame": z_drift_ssim["start_frame"],
-                    "z_drift_ssim_end_frame": z_drift_ssim["end_frame"],
-                    "z_drift_ssim_frame_diff": z_drift_ssim["end_frame"]
-                    - z_drift_ssim["start_frame"],
-                    "z_drift_ssim_um_diff": (
-                        z_drift_ssim["end_frame"] - z_drift_ssim["start_frame"]
-                    )
-                    * self.meta["z_spacing_um"],
-                    "z_drift_start_frame_match_method": "algorithm",
-                    "z_drift_end_frame_match_method": "algorithm",
-                }
-            )
-        except ValueError:  # SSIM is optional
-            logger.debug(
-                "Unable to compute SSIM for session {}".format(
-                    self.ophys_experiment.lims_id
-                )
-            )
-            pass
-
-    def process_stack(self):
-        """Averages common z-planes across loops.
-        #TODO: Need to correct for motion.
-
-        Returns:
-            An array of shape (self.meta['nb_of_planes'] - (ignore_top + ignore_bot), Y, X)
+        Returns
+        -------
+        numpy.ndarray
+            An array of shape ``(self.meta['nb_of_planes'], Y, X)``.
         """
         stack = []
         with h5py.File(self.zstack_filepath, "r") as f:
             local_z_stack = f["data"][()]
+            # TODO: correct for motion between loops before averaging.
             for plane_ind in range(self.meta["nb_of_planes"]):
                 single_plane_images = local_z_stack[
                     range(
-                        plane_ind, self.meta["data_shape"][0], self.meta["nb_of_planes"]
+                        plane_ind,
+                        self.meta["data_shape"][0],
+                        self.meta["nb_of_planes"],
                     ),
                     ...,
                 ]
@@ -121,18 +89,35 @@ class LocalZStack:
 
         return stack
 
-    def _input_process(self, input_image, gaussian_filter=False, sigma=3, shift=(0, 0)):
-        """Processes the local z stack and the input image.
-         Z-stack is cropped, shifted, and blurred.  Input image is blurred.
+    def _input_process(
+        self,
+        input_image: np.ndarray,
+        gaussian_filter: bool = False,
+        sigma: int = 3,
+        shift: Optional[Tuple[int, int]] = (0, 0),
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Process the local z-stack and the input image.
 
-        Args:
-            input_image:  2D array to compare to the local z stack planes
-            gaussian_filter:  A boolean denoting whether or not to apply a 2D gaussian filter
-            sigma:  The width of the 2D gaussian filter
-            shift: A tuple denoting (px_y, px_x) the number of pixels to shift, default (0, 0)
+        The z-stack is cropped, shifted and blurred; the input image is
+        blurred.
 
-        Returns:
-            The processed stack (also cached) and input image as numpy arrays.
+        Parameters
+        ----------
+        input_image : numpy.ndarray
+            2D array to compare to the local z-stack planes.
+        gaussian_filter : bool
+            Whether to apply a 2D gaussian filter.
+        sigma : int
+            The width of the 2D gaussian filter.
+        shift : tuple
+            ``(px_y, px_x)`` number of pixels to shift.
+
+        Returns
+        -------
+        numpy.ndarray
+            The processed stack.
+        numpy.ndarray
+            The processed input image.
         """
         z_stack = self.zstack.copy()
 
@@ -146,33 +131,43 @@ class LocalZStack:
             zstack_shape = z_stack.shape
             input_image_shape = input_image.shape
             assert (
-                zstack_shape[1] == input_image_shape[0]
-                and zstack_shape[2] == input_image_shape[1]
+                zstack_shape[1] == input_image_shape[0] and zstack_shape[2] == input_image_shape[1]
             ), "Z stack shape {} does not match input image shape {}".format(
                 zstack_shape, input_image_shape
             )
-            y_range_input, x_range_input, y_range_zstack, x_range_zstack = (
-                self._range_from_shift(shift)
-            )
+            (
+                y_range_input,
+                x_range_input,
+                y_range_zstack,
+                x_range_zstack,
+            ) = self._range_from_shift(shift)
             z_stack = z_stack[
                 :,
                 y_range_zstack[0] : y_range_zstack[1],
                 x_range_zstack[0] : x_range_zstack[1],
             ]
             input_image = input_image[
-                y_range_input[0] : y_range_input[1], x_range_input[0] : x_range_input[1]
+                y_range_input[0] : y_range_input[1],
+                x_range_input[0] : x_range_input[1],
             ]
 
         return z_stack, input_image
 
-    def _range_from_shift(self, shift):
-        """Returns the range of pixels to crop from the images and z stack based on the shift.
-        Args:
-            shift: A tuple denoting (px_y, px_x) the number of pixels to shift.
+    def _range_from_shift(
+        self, shift: Tuple[int, int]
+    ) -> Tuple[Tuple[int, int], Tuple[int, int], Tuple[int, int], Tuple[int, int]]:
+        """Return the pixel ranges to crop from the images and the z-stack.
 
-        Returns:
-            Tuples y_range_input, x_range_input, y_range_zstack, x_range_zstack
-                each tuple contains the start and end pixel indices for cropping.
+        Parameters
+        ----------
+        shift : tuple
+            ``(px_y, px_x)`` number of pixels to shift.
+
+        Returns
+        -------
+        tuple
+            ``y_range_input``, ``x_range_input``, ``y_range_zstack``,
+            ``x_range_zstack``, each a ``(start, end)`` pixel index pair.
         """
         _, y, x = self.meta["data_shape"]
 
@@ -182,7 +177,21 @@ class LocalZStack:
         x_range_zstack = (max(0, shift[1]), shift[1] if shift[1] < 0 else x)
         return y_range_input, x_range_input, y_range_zstack, x_range_zstack
 
-    def _get_shift(self, register, image):
+    def _get_shift(self, register: bool, image: np.ndarray) -> Tuple[int, int]:
+        """Return the registration shift between an image and the z-stack.
+
+        Parameters
+        ----------
+        register : bool
+            Whether to register at all; ``False`` yields no shift.
+        image : numpy.ndarray
+            The image to register against the z-projected stack.
+
+        Returns
+        -------
+        tuple
+            ``(px_y, px_x)`` integer shift.
+        """
         if register:
             # Register start image to z projected stack
             if hasattr(self, "register_shift"):
@@ -197,196 +206,152 @@ class LocalZStack:
             shift = (0, 0)
         return shift
 
-    def plot_z_drift_scores(
-        self,
-        start_image,
-        end_image,
-        gaussian_filter=True,
-        sigma=3,
-        register=True,
-        metric="corr",
-    ):
-        """Generate a score vs. depth plot for a given z-drift metric.
-
-        Args:
-            start_image, end_image:  2D arrays to compare to the local z stack planes
-            gaussian_filter:  A boolean denoting whether or not to apply a 2D gaussian filter
-            sigma:  The width of the 2D gaussian filter
-            shift: A tuple denoting (px_y, px_x) the number of pixels to shift, default (0, 0)
-            metric:  Metric choice, either pearson correlation (corr) or ssim (ssim)
-
-        Returns:
-            A figure.
-        """
-        shift = self._get_shift(register=register, image=start_image)
-
-        if metric == "corr":
-            start_coefs = self.get_corr_z_planes(
-                start_image, gaussian_filter=gaussian_filter, sigma=sigma, shift=shift
-            )
-            end_coefs = self.get_corr_z_planes(
-                end_image, gaussian_filter=gaussian_filter, sigma=sigma, shift=shift
-            )
-        elif metric == "ssim":
-            start_coefs = self.get_ssim_z_planes(
-                start_image, gaussian_filter=gaussian_filter, sigma=sigma, shift=shift
-            )
-            end_coefs = self.get_ssim_z_planes(
-                end_image, gaussian_filter=gaussian_filter, sigma=sigma, shift=shift
-            )
-        else:
-            raise NotImplementedError("Unhandled z-drift metric type {}".format(metric))
-
-        z_spacing = self.meta["z_spacing_um"]
-
-        fig = plt.figure()
-        plt.plot(
-            np.arange(0, len(start_coefs)) * z_spacing,
-            start_coefs,
-            marker=".",
-            label="Start {}".format(metric.upper()),
-        )
-        plt.plot(
-            np.arange(0, len(end_coefs)) * z_spacing,
-            end_coefs,
-            marker=".",
-            label="End {}".format(metric.upper()),
-        )
-
-        plt.axvline(start_coefs.argmax() * z_spacing, color="black")
-        plt.axvline(end_coefs.argmax() * z_spacing, color="black")
-        plt.legend()
-        plt.ylabel("Score")
-        plt.xlabel(r"Depth ($um$)")
-        plt.tight_layout()
-        return fig
-
     def get_corr_z_planes(
         self,
-        input_image,
-        gaussian_filter=True,
-        sigma=3,
-        shift=(0, 0),
-        ignore_top=5,
-        ignore_bot=5,
-    ):
-        """Compares input_image to each z-plane of the local z stack. Returns correlation coefficients.
+        input_image: np.ndarray,
+        gaussian_filter: bool = True,
+        sigma: int = 3,
+        shift: Optional[Tuple[int, int]] = (0, 0),
+        ignore_top: int = 5,
+        ignore_bot: int = 5,
+    ) -> np.ndarray:
+        """Correlate ``input_image`` against each z-plane of the local stack.
 
-        Args:
-            input_image:  2D array to compare to the local z stack planes
-            crop:  A tuple (px_y, px_x) specifying the number of pixels to remove from stack
-            gaussian_filter:  A boolean denoting whether or not to apply a 2D gaussian filter
-            sigma:  The width of the 2D gaussian filter
-            shift: A tuple denoting (px_y, px_x) the number of pixels to shift, default (0, 0)
-            ignore_top:  Number of planes to ignore from the top
-            ignore_bot:  Number of planes to ignore from the bottom
+        Parameters
+        ----------
+        input_image : numpy.ndarray
+            2D array to compare to the local z-stack planes.
+        gaussian_filter : bool
+            Whether to apply a 2D gaussian filter.
+        sigma : int
+            The width of the 2D gaussian filter.
+        shift : tuple
+            ``(px_y, px_x)`` number of pixels to shift.
+        ignore_top : int
+            Number of planes to ignore from the top.
+        ignore_bot : int
+            Number of planes to ignore from the bottom.
 
-        Returns:
+        Returns
+        -------
+        numpy.ndarray
             An array of correlation coefficients.
         """
         z_stack, input_image = self._input_process(
             input_image, gaussian_filter=gaussian_filter, sigma=sigma, shift=shift
         )
         coeffs = [
-            np.corrcoef(input_image.flatten(), z_plane.flatten())[0, 1]
-            for z_plane in z_stack
+            np.corrcoef(input_image.flatten(), z_plane.flatten())[0, 1] for z_plane in z_stack
         ]
 
-        # Set ignore planes to 0 correlation
+        # Set ignore planes to the minimum correlation
         coeffs[:ignore_top] = np.ones(ignore_top) * np.min(coeffs)
         coeffs[-ignore_bot:] = np.ones(ignore_bot) * np.min(coeffs)
         return np.array(coeffs)
 
     def get_ssim_z_planes(
         self,
-        input_image,
-        crop=(0, 0),
-        gaussian_filter=False,
-        sigma=5,
-        shift=None,
-        ignore_top=5,
-        ignore_bot=5,
-    ):
-        """Compares input_image to each z-plane of the local z stack. Returns correlation coefficients.
+        input_image: np.ndarray,
+        gaussian_filter: bool = False,
+        sigma: int = 5,
+        shift: Optional[Tuple[int, int]] = None,
+        ignore_top: int = 5,
+        ignore_bot: int = 5,
+    ) -> np.ndarray:
+        """Compare ``input_image`` to each z-plane of the stack, using SSIM.
 
-        Args:
-            input_image:  2D array to compare to the local z stack planes
-            crop:  A tuple (px_y, px_x) specifying the number of pixels to remove from stack
-            gaussian_filter:  A boolean denoting whether or not to apply a 2D gaussian filter
-            sigma:  The width of the 2D gaussian filter
-            shift: A tuple denoting (0, px_y, px_x) the number of pixels to shift, or None
-            ignore_top:  Number of planes to ignore from the top
-            ignore_bot:  Number of planes to ignore from the bottom
+        Parameters
+        ----------
+        input_image : numpy.ndarray
+            2D array to compare to the local z-stack planes.
+        gaussian_filter : bool
+            Whether to apply a 2D gaussian filter.
+        sigma : int
+            The width of the 2D gaussian filter.
+        shift : tuple or None
+            ``(px_y, px_x)`` number of pixels to shift, or ``None``.
+        ignore_top : int
+            Number of planes to ignore from the top.
+        ignore_bot : int
+            Number of planes to ignore from the bottom.
 
-        Returns:
-            An array of correlation coefficients.
+        Returns
+        -------
+        numpy.ndarray
+            An array of SSIM values.
         """
         z_stack, input_image = self._input_process(
             input_image, gaussian_filter=gaussian_filter, sigma=sigma, shift=shift
         )
         ssim_values = [ssim(input_image, z_plane) for z_plane in z_stack]
 
-        # Set ignore planes to 0 correlation
+        # Set ignore planes to the minimum SSIM
         ssim_values[:ignore_top] = np.ones(ignore_top) * np.min(ssim_values)
         ssim_values[-ignore_bot:] = np.ones(ignore_bot) * np.min(ssim_values)
         return np.array(ssim_values)
 
     def get_z_drift(
         self,
-        nb_frames_to_avg=500,
-        gaussian_filter=True,
-        sigma=3,
-        register=True,
-        metric="corr",
-    ):
-        """Determine the amount of z-drift in the motion corrected physio movie..
-        # Note: This code assumes stable motion during z-stack imaging.
+        nb_frames_to_avg: int = 500,
+        gaussian_filter: bool = True,
+        sigma: int = 3,
+        register: bool = True,
+        metric: str = "corr",
+    ) -> Tuple[Dict[str, Any], Dict[str, np.ndarray]]:
+        """Determine the amount of z-drift in the motion-corrected movie.
 
-        Args:
-            nb_frames_to_avg:  Number of frames to average in the physio movie
-            gaussian_filter:  A boolean denoting whether or not to apply a 2D gaussian filter
-            sigma:  The width of the gaussian filter
-            register: A boolean specifying whether or not to register start_image to projected zstack for shift
-            save_images: A boolean specifying whether or not to save the resultant images from this calculation
-            metric:  Metric choice, either pearson correlation (corr) or ssim (ssim)
+        Assumes stable motion during z-stack imaging.
 
-        Returns:
-            A dict of z-drift information.
-            A dict of of images to save.
-                All with shifts applied. (vmin and vmax to be calculated during imshow)
+        Parameters
+        ----------
+        nb_frames_to_avg : int
+            Number of frames to average at each end of the physio movie.
+        gaussian_filter : bool
+            Whether to apply a 2D gaussian filter.
+        sigma : int
+            The width of the gaussian filter.
+        register : bool
+            Whether to register the start image to the projected z-stack.
+        metric : str
+            Either ``"corr"`` (Pearson correlation) or ``"ssim"``.
+
+        Returns
+        -------
+        dict
+            Z-drift information.
+        dict
+            Images to save, with shifts already applied.
+
+        Raises
+        ------
+        NotImplementedError
+            If ``metric`` is not one of the supported values.
         """
-
         with h5py.File(self.physio_filepath, "r") as f:
             start_image = np.array(f["data"][:nb_frames_to_avg, ...]).mean(axis=0)
             end_image = np.array(f["data"][-(nb_frames_to_avg + 1) :, ...]).mean(axis=0)
 
         shift = self._get_shift(register=register, image=start_image)
 
-        correlation_scores = {}
         if metric == "corr":
-            start_corr = self.get_corr_z_planes(
-                start_image, gaussian_filter=gaussian_filter, sigma=sigma, shift=shift
-            )
-            start_idx = int(np.argmax(start_corr))
-            correlation_scores["start_frame_corr"] = start_corr[start_idx]
-            end_corr = self.get_corr_z_planes(
-                end_image, gaussian_filter=gaussian_filter, sigma=sigma, shift=shift
-            )
-            end_idx = int(np.argmax(end_corr))
-            correlation_scores["end_frame_corr"] = end_corr[end_idx]
+            score_z_planes = self.get_corr_z_planes
         elif metric == "ssim":
-            start_corr = self.get_ssim_z_planes(
-                start_image, gaussian_filter=gaussian_filter, sigma=sigma, shift=shift
-            )
-            start_idx = int(np.argmax(start_corr))
-            correlation_scores["start_frame_ssim"] = start_corr[start_idx]
-            end_corr = self.get_ssim_z_planes(
-                end_image, gaussian_filter=gaussian_filter, sigma=sigma, shift=shift
-            )
-            end_idx = int(np.argmax(end_corr))
-            correlation_scores["end_frame_ssim"] = end_corr[end_idx]
+            score_z_planes = self.get_ssim_z_planes
         else:
             raise NotImplementedError("Unhandled z-drift metric type {}".format(metric))
+
+        start_corr = score_z_planes(
+            start_image, gaussian_filter=gaussian_filter, sigma=sigma, shift=shift
+        )
+        start_idx = int(np.argmax(start_corr))
+        end_corr = score_z_planes(
+            end_image, gaussian_filter=gaussian_filter, sigma=sigma, shift=shift
+        )
+        end_idx = int(np.argmax(end_corr))
+        correlation_scores = {
+            f"start_frame_{metric}": start_corr[start_idx],
+            f"end_frame_{metric}": end_corr[end_idx],
+        }
         z_drift_metrics = {
             "start_frame": start_idx,
             "end_frame": end_idx,
@@ -397,9 +362,12 @@ class LocalZStack:
         }
         z_drift_metrics.update(correlation_scores)
 
-        y_range_input, x_range_input, y_range_zstack, x_range_zstack = (
-            self._range_from_shift(shift)
-        )
+        (
+            y_range_input,
+            x_range_input,
+            y_range_zstack,
+            x_range_zstack,
+        ) = self._range_from_shift(shift)
 
         save_imgs = {}
         save_imgs["start_image"] = start_image[
@@ -421,10 +389,16 @@ class LocalZStack:
 
         return z_drift_metrics, save_imgs
 
-    def local_zstack_metadata(self):
-        """Get scanimage metadata and ROI groups from a local z-stack
-        and save to self.meta
+    def local_zstack_metadata(self) -> None:
+        """Read the z-stack's ScanImage metadata into ``self.meta``.
 
+        Raises
+        ------
+        ValueError
+            If the HDF5 file has no ``scanimage_metadata`` entry, or if
+            ``data`` is not a dataset.
+        Exception
+            If the frame count disagrees with the ScanImage metadata.
         """
         zstack_path = Path(self.zstack_filepath)
         with h5py.File(zstack_path, "r") as f:
@@ -434,7 +408,6 @@ class LocalZStack:
         si = si.decode()
         si = json.loads(si)
         si_metadata = si[0]
-        roi_groups = si[1]
 
         nb_of_loops = int(si_metadata["SI.hStackManager.actualNumVolumes"])
         nb_of_planes = int(si_metadata["SI.hStackManager.actualNumSlices"])
@@ -448,32 +421,14 @@ class LocalZStack:
         self.meta["nb_of_loops"] = nb_of_loops
         self.meta["nb_of_planes"] = nb_of_planes
         self.meta["z_spacing_um"] = z_spacing_um
-        self.meta["total_z_distance"] = (self.meta["nb_of_planes"] - 1) * self.meta[
-            "z_spacing_um"
-        ]
+        self.meta["total_z_distance"] = (nb_of_planes - 1) * z_spacing_um
         self.meta["data_shape"] = local_zstack_shape
-
-        with open(self.session_json_path, "r") as f:
-            session_json = json.load(f)
-        xy_scale = float(
-            session_json["data_streams"][0]["ophys_fovs"][0]["fov_scale_factor"]
-        )
-        if (
-            session_json["data_streams"][0]["ophys_fovs"][0]["fov_scale_factor_unit"]
-            == "um/pixel"
-        ):
-            self.meta["fov_scale_factor"] = xy_scale
-        else:
-            raise NotImplementedError(
-                "Unhandled fov scale factor unit {}".format(
-                    session_json["data_streams"][0]["ophys_fovs"][0][
-                        "fov_scale_factor_unit"
-                    ]
-                )
+        self.meta["fov_scale_factor"] = self.fov_scale_factor
+        if self.fov_scale_factor is None:
+            logger.warning(
+                "No fov_scale_factor resolved from the acquisition metadata; "
+                "recording it as null in the z-drift provenance."
             )
 
-        if (
-            self.meta["nb_of_loops"] * self.meta["nb_of_planes"]
-            != self.meta["data_shape"][0]
-        ):
+        if nb_of_loops * nb_of_planes != local_zstack_shape[0]:
             raise Exception("Number of frames in local z stack different from metadata")
