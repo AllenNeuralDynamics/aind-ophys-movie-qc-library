@@ -333,6 +333,8 @@ class LocalZStack:
 
         shift = self._get_shift(register=register, image=start_image)
 
+        # Both metrics write the same start_frame_corr/end_frame_corr keys, so a
+        # downstream reader does not need to know which metric produced them.
         if metric == "corr":
             score_z_planes = self.get_corr_z_planes
         elif metric == "ssim":
@@ -349,8 +351,9 @@ class LocalZStack:
         )
         end_idx = int(np.argmax(end_corr))
         correlation_scores = {
-            f"start_frame_{metric}": start_corr[start_idx],
-            f"end_frame_{metric}": end_corr[end_idx],
+            "metric": metric,
+            "start_frame_corr": start_corr[start_idx],
+            "end_frame_corr": end_corr[end_idx],
         }
         z_drift_metrics = {
             "start_frame": start_idx,
