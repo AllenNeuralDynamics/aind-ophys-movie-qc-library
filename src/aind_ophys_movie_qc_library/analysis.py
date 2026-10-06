@@ -4,8 +4,9 @@ These routines produce the values reviewers read in QC Portal, so their
 numerics are held fixed. Coverage-omitted - they need a real movie to exercise.
 """
 
+import logging
 from pathlib import Path
-from typing import Sequence, Tuple, Union
+from typing import Optional, Sequence, Tuple, Union
 
 import h5py
 import matplotlib.patches as patches
@@ -17,6 +18,8 @@ from scipy import ndimage
 from scipy.linalg import LinAlgError
 from scipy.stats import gaussian_kde
 from skimage import filters, measure
+
+logger = logging.getLogger("Ophys movie QC")
 
 # Frames skipped at each end of the movie when extracting stability windows.
 IGNORE_FRAMES = 300
@@ -44,7 +47,7 @@ def get_and_plot_epilepsy_probability(
     signal_threshold: float = 10.0,
     min_width: float = 0.1,
     max_width: float = 0.3,
-) -> Tuple[float, plt.Figure]:
+) -> Tuple[float, Optional[plt.Figure]]:
     """Get the probability of epilepsy in this physio movie.
 
     Parameters
@@ -64,8 +67,9 @@ def get_and_plot_epilepsy_probability(
     -------
     float
         The probability of epilepsy.
-    matplotlib.figure.Figure
-        A figure showing the epilepsy plot.
+    matplotlib.figure.Figure or None
+        A figure showing the epilepsy plot, or ``None`` when the deconvolved
+        signal is flat and there is nothing to plot.
 
     Raises
     ------
@@ -78,7 +82,9 @@ def get_and_plot_epilepsy_probability(
     denoised_signal, spike_events, _, _, _ = oasis_deconvolve(perc_diff, penalty=1)
 
     if set(denoised_signal) == {0.0}:  # No signal
-        return 0
+        # Two values, because every caller unpacks two.
+        logger.warning("Deconvolved signal is flat; reporting zero epilepsy probability.")
+        return 0.0, None
 
     prominence_data, widths = get_spike_prominence_and_width(
         denoised_signal, spike_events, frame_rate=frame_rate
@@ -154,8 +160,10 @@ def get_spike_prominence_and_width(
         local_diff = local_amplitude - filtered_signal
         larger_spike_idxs = event_idxs[local_diff < 0]
 
+        # Emptiness, not truthiness, in this and the three guards below: index 0
+        # is a real index, and `.any()` tests for a non-zero value instead.
         pre_spike_idxs = larger_spike_idxs[larger_spike_idxs < event_idx]
-        if not pre_spike_idxs.any():
+        if pre_spike_idxs.size == 0:
             pre_spike_idx = 0
         else:
             # Nearest spike larger than the local spike, on the left
@@ -166,7 +174,7 @@ def get_spike_prominence_and_width(
         pre_min = np.min(pre_spikes)
 
         post_peak_idxs = larger_spike_idxs[larger_spike_idxs > event_idx]
-        if not post_peak_idxs.any():
+        if post_peak_idxs.size == 0:
             post_peak_idx = len(denoised_signal)
         else:
             # Nearest spike larger than the local spike, on the right
@@ -182,13 +190,13 @@ def get_spike_prominence_and_width(
 
         # Width calculation
         pre_half_idxs = np.where(pre_spikes < local_amplitude - local_prominence / 2)[0]
-        if not pre_half_idxs.any():
+        if pre_half_idxs.size == 0:
             pre_half_idx = len(pre_spikes)
         else:
             pre_half_idx = np.min(len(pre_spikes) - pre_half_idxs)
 
         post_half_idxs = np.where(post_spikes < local_amplitude - local_prominence / 2)[0]
-        if not post_half_idxs.any():
+        if post_half_idxs.size == 0:
             post_half_idx = len(post_spikes)
         else:
             post_half_idx = np.min(post_half_idxs)
