@@ -3,7 +3,7 @@
 import json
 import logging
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
 
 import h5py
 import numpy as np
@@ -214,7 +214,7 @@ def _write_figures(
     metrics: dict,
     epilepsy_figure: Figure,
     context: dict,
-) -> Tuple[dict, List[str]]:
+) -> dict:
     """Render and save every figure, returning results-relative references.
 
     Parameters
@@ -235,9 +235,9 @@ def _write_figures(
 
     Returns
     -------
-    tuple of (dict, list of str)
-        Figure references keyed by the ``qc.REF_*`` constants, and the
-        projection-figure paths, all relative to the results root.
+    dict
+        Figure references keyed by the ``qc.REF_*`` constants, relative to the
+        results root.
     """
     output_dir = context["output_dir"]
     base_file = context["base_file"]
@@ -248,9 +248,8 @@ def _write_figures(
         return analysis.save_figure_to_storage(figure, output_dir, base_file, image_name)
 
     paths = {}
-    projection_paths = [
-        _save(analysis.plot_projection_image(windows["small_cropped"]), "mean_projection_image")
-    ]
+    # The projection figures are written but no QC metric references them.
+    _save(analysis.plot_projection_image(windows["small_cropped"]), "mean_projection_image")
     paths[qc.REF_EPILEPSY] = _save(epilepsy_figure, "epilepsy_probability")
 
     segmentation_path = None
@@ -259,15 +258,12 @@ def _write_figures(
             ("start_section", "start_projection_image"),
             ("end_section", "end_projection_image"),
         ):
-            projection_paths.append(
-                _save(analysis.plot_projection_image(windows[section]), image_name)
-            )
+            _save(analysis.plot_projection_image(windows[section]), image_name)
         rois_data, roi_figure = analysis.get_and_plot_basic_segmentation(windows["start_section"])
         segmentation_path = _save(roi_figure, "basic_segmentation_image")
         metrics.update(rois_data)
         _photon_and_dprime_metrics(settings, metrics, context["frame_rate"])
 
-    paths[qc.REF_PROJECTIONS] = projection_paths[0]
     paths[qc.REF_INTENSITY_PLOT] = _save(
         analysis.plot_avg_intensity_progression(
             windows["full_length"], binning=analysis.FULL_LENGTH_BINNING
@@ -291,9 +287,7 @@ def _write_figures(
             output_dir / f"{context['unique_id']}_roi_and_photon_metrics.png",
         )
 
-    references = {key: relative_to_root(results_root, path) for key, path in paths.items()}
-    projections = [relative_to_root(results_root, path) for path in projection_paths]
-    return references, projections
+    return {key: relative_to_root(results_root, path) for key, path in paths.items()}
 
 
 def _run_zdrift(
@@ -450,7 +444,7 @@ def _run_movie_qc(
     )
     metrics["epilepsy_probability"] = probability
 
-    references, projections = _write_figures(settings, windows, metrics, epilepsy_figure, context)
+    references = _write_figures(settings, windows, metrics, epilepsy_figure, context)
 
     zdrift, zdrift_reference = _run_zdrift(settings, metadata, movie_path, context)
     if zdrift is not None:
@@ -464,7 +458,6 @@ def _run_movie_qc(
         unique_id=unique_id,
         metrics=metrics,
         references=references,
-        projections=projections,
         short_movie_mode=windows["short_movie_mode"],
         zdrift=zdrift,
     )
