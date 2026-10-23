@@ -64,7 +64,7 @@ drift in micrometres plus the images the figure needs.
 Metric content for `quality_control.json`. Metric-producing functions
 (`build_intensity_metric`, `build_epilepsy_metric`,
 `build_event_detection_metric`, `build_pixel_distribution_metric`,
-`build_photon_metric`, `build_zdrift_metric`, `build_projection_metric`) return
+`build_photon_metric`, `build_zdrift_metric`) return
 metrics; `collect_metrics` applies the run's gating and accumulates them, and
 `build_quality_control` plus `write_quality_control_json` write one document per
 plane. `intensity_status` and `saturation_status` hold the automatic thresholds.
@@ -122,7 +122,7 @@ registered movie's stem:
   `AssetPath ... does not exist` warning on it is expected and cosmetic:
   `output_path` is relative to the results root while the file sits two levels
   deeper.
-- `quality_control.json` — a full `QualityControl` document. Up to seven
+- `quality_control.json` — a full `QualityControl` document. Up to six
   metrics, each name prefixed with the plane id and each tagged into its own
   `evaluation` group.
 
