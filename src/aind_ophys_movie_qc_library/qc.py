@@ -6,15 +6,16 @@ accumulates them, so ``job.run`` writes exactly one ``quality_control.json``
 per plane (the collector pattern).
 
 Grouping is carried by every metric's ``evaluation`` tag, matching
-``QualityControl.default_grouping = ["evaluation"]``. Statuses are
+``QualityControl.default_grouping = ["evaluation"]``, and its ``type`` tag
+follows from the group: the photon and event detection statistics are
+informational, every other group is operational QC. Statuses are
 auto-computed from the measured values, so
 ``aind_pophys_metadata.quality_control.pending_qc_status`` (which hardcodes
 PENDING) is not usable and ``QCStatus`` is built directly. Every metric seeds
 a status: an empty ``status_history`` is rejected at construction.
 
 Every metric name is prefixed with the plane id so a multiplane run's metrics
-stay distinct, and a projection-images metric gives the projection figures a
-reviewer surface.
+stay distinct.
 """
 
 from datetime import datetime as dt
@@ -31,7 +32,8 @@ from aind_data_schema.core.quality_control import (
 from aind_data_schema_models.modalities import Modality
 from aind_pophys_metadata import quality_control as shared_qc
 
-METRIC_TYPE = "Operational QC"
+OPERATIONAL_TYPE = "Operational QC"
+INFORMATIONAL_TYPE = "Informational"
 EVALUATOR = "Automated"
 
 EVALUATION_INTENSITY = "Intensity Drift"
@@ -40,7 +42,16 @@ EVALUATION_EVENTS = "Event detection statistics"
 EVALUATION_PIXELS = "Pixel Saturation"
 EVALUATION_PHOTONS = "Photon detection statistics"
 EVALUATION_ZDRIFT = "Z-drift"
-EVALUATION_PROJECTIONS = "Projection images"
+
+# The ``type`` tag of every ``evaluation`` group.
+EVALUATION_TYPES = {
+    EVALUATION_INTENSITY: OPERATIONAL_TYPE,
+    EVALUATION_EPILEPSY: OPERATIONAL_TYPE,
+    EVALUATION_EVENTS: INFORMATIONAL_TYPE,
+    EVALUATION_PIXELS: OPERATIONAL_TYPE,
+    EVALUATION_PHOTONS: INFORMATIONAL_TYPE,
+    EVALUATION_ZDRIFT: OPERATIONAL_TYPE,
+}
 
 # Automatic status thresholds, named rather than inline.
 INTENSITY_FAIL_PERCENT = 20
@@ -56,7 +67,6 @@ REF_INTENSITY_HIST = "intensity_hist"
 REF_EPILEPSY = "epilepsy"
 REF_COMBINED = "roi_and_photon"
 REF_ZDRIFT = "zdrift"
-REF_PROJECTIONS = "mean_projection"
 
 
 def _auto_status(status: Status) -> QCStatus:
@@ -94,7 +104,8 @@ def _metric(
     name : str
         Metric name, already prefixed with the plane id.
     evaluation : str
-        Value of the ``evaluation`` tag, naming the group this metric joins.
+        Value of the ``evaluation`` tag, naming the group this metric joins;
+        a key of ``EVALUATION_TYPES``, which supplies the ``type`` tag.
     value : Any
         The measured value; ``QCMetric.value`` is typed ``Any``, so a scalar,
         string or dict all validate.
@@ -114,7 +125,7 @@ def _metric(
         name=name,
         modality=Modality.POPHYS,
         stage=Stage.PROCESSING,
-        tags={"evaluation": evaluation, "type": METRIC_TYPE},
+        tags={"evaluation": evaluation, "type": EVALUATION_TYPES[evaluation]},
         description=description,
         reference=reference,
         status_history=[_auto_status(status)],
@@ -193,16 +204,10 @@ def build_intensity_metric(
         evaluation=EVALUATION_INTENSITY,
         value=f"{intensity_change:.2f}%",
         description=(
-            "This metric quantifies the percent change in mean pixel intensity from the "
-            "start to the end of the movie. It is calculated as 100 * (end_mean - "
-            "start_mean) / start_mean, where start_mean is the average pixel value over "
-            "200 frames starting 300 frames into the movie and end_mean the average over "
-            "201 frames ending 300 frames before its end. A large negative value "
-            "indicates photobleaching or instability. Status is automatically assigned: "
-            f"PASS if |change| < {INTENSITY_PENDING_PERCENT}%, PENDING if "
-            f"{INTENSITY_PENDING_PERCENT}% <= |change| < {INTENSITY_FAIL_PERCENT}%, FAIL if "
-            f"|change| >= {INTENSITY_FAIL_PERCENT}%. If the status is not PASS, review the "
-            "intensity progression plot for abrupt drops or trends."
+            "Percent change in mean intensity between a window near the start and one "
+            "near the end of the movie. "
+            f"Pass below {INTENSITY_PENDING_PERCENT}%, Pending below {INTENSITY_FAIL_PERCENT}%, "
+            f"Fail at {INTENSITY_FAIL_PERCENT}% or more. A large drop suggests photobleaching."
         ),
         status=intensity_status(intensity_change),
         reference=reference,
@@ -236,13 +241,9 @@ def build_epilepsy_metric(
         evaluation=EVALUATION_EPILEPSY,
         value=probability,
         description=(
-            "This metric estimates the probability of epileptiform activity in the movie "
-            "using deconvolution and event detection. The signal is denoised and events "
-            "are detected; events with prominence > 10 and width between 0.1 and 0.3 "
-            "seconds are considered epileptic. The metric is the fraction of such events "
-            "among all detected events. Status is automatically assigned: PASS if "
-            "probability is 0, FAIL otherwise. If FAIL, inspect the event plot for "
-            "clusters of large, brief events."
+            "Fraction of detected events that look epileptiform (prominence above 10, "
+            "width 0.1 to 0.3 s). Pass if zero, otherwise Fail; on Fail, look for "
+            "clusters of large, brief events in the event plot."
         ),
         status=Status.FAIL if probability > 0 else Status.PASS,
         reference=reference,
@@ -287,16 +288,9 @@ def build_event_detection_metric(
         evaluation=EVALUATION_EVENTS,
         value=values,
         description=(
-            "This metric combines signal-to-noise ratio (SNR) and event detection "
-            "(d-prime) statistics. SNR is calculated as the mean pixel value divided by "
-            "the standard deviation for each frame, summarized as mean, median, and "
-            "standard deviation across the movie. Higher SNR indicates better image "
-            "quality. D-prime is calculated for each ROI using photon flux and neuropil "
-            "estimates, following Wilt et al. (2013), and summarized as the median and "
-            "standard deviation. Higher d-prime values indicate better event "
-            "detectability; both are omitted when the movie is too short to compute "
-            "them. Status is always PASS (no automatic threshold). Review low SNR or "
-            "d-prime values for possible issues with signal quality or event detection."
+            "Frame signal-to-noise ratio and per-ROI d-prime (Wilt et al., 2013), "
+            "summarized across frames and ROIs. Low values point to weak signal or poor "
+            "event detectability. D-prime is not computed for very short movies."
         ),
         status=Status.PASS,
     )
@@ -336,14 +330,11 @@ def build_pixel_distribution_metric(
             "Intensity Percentile Upper (95th)": float(metrics.get("percentile_upper", 0.0)),
         },
         description=(
-            "This metric summarizes the distribution of pixel values in the movie, "
-            "including the number of saturated pixels (at or above max range), low "
-            "intensity pixels (at or below min range), and the 5th/95th percentiles. "
-            "Saturated and low pixels are counted in the first 500 frames of the analysed "
-            "block. Status is automatically assigned: PASS if saturated pixels < "
-            f"{SATURATED_PIXELS_PENDING}, PENDING if {SATURATED_PIXELS_PENDING} <= saturated "
-            f"< {SATURATED_PIXELS_FAIL}, FAIL if >= {SATURATED_PIXELS_FAIL}. If not PASS, "
-            "review the intensity histogram for evidence of clipping or poor dynamic range."
+            "Saturated and low-intensity pixel counts over the first 500 frames of the "
+            "analysed block, with the 5th and 95th percentiles. Pass below "
+            f"{SATURATED_PIXELS_PENDING} saturated pixels, Pending from "
+            f"{SATURATED_PIXELS_PENDING} to {SATURATED_PIXELS_FAIL - 1}, Fail at "
+            f"{SATURATED_PIXELS_FAIL} or more."
         ),
         status=saturation_status(saturated_pixels),
         reference=reference,
@@ -394,15 +385,9 @@ def build_photon_metric(
             ),
         },
         description=(
-            "This metric summarizes photon detection. ROI segmentation is performed "
-            "using Otsu thresholding on a high-pass filtered median image from the start "
-            "of the movie. Mean ROI intensity, segmentation threshold, and median "
-            "neuropil sum are reported. Photon gain and offset are estimated by fitting "
-            "the variance vs. mean relationship for non-saturated pixels. Photon flux "
-            "and background noise are derived from these parameters. Photon statistics "
-            "are reported as mean/median values per ROI and neuropil, per frame and per "
-            "second. Status is always PASS (no automatic threshold). Review for outliers "
-            "or unexpected values."
+            "Photon gain and offset fitted from pixel variance against mean, with the "
+            "resulting background noise and the photon flux of ROIs and neuropil. "
+            "Check for outliers."
         ),
         status=Status.PASS,
         reference=reference,
@@ -467,54 +452,12 @@ def build_zdrift_metric(
         evaluation=EVALUATION_ZDRIFT,
         value=values,
         description=(
-            "Z-drift analysis metrics. The means of the first 500 and last 501 frames of "
-            "the registered movie are each correlated against every plane of the local "
-            "z-stack; the difference between the best-matching planes, scaled by the "
-            "z-stack spacing, is the drift. Status is automatically assigned: PASS if "
-            f"|z_drift_um| <= {ZDRIFT_QC_THRESHOLD_UM} um, FAIL otherwise."
+            "Depth drift over the session: the start and end of the registered movie are "
+            "each matched to the local z-stack, and the drift is the depth difference "
+            "between the best-matching planes. "
+            f"Pass within {ZDRIFT_QC_THRESHOLD_UM} um, otherwise Fail."
         ),
         status=status,
-        reference=reference,
-    )
-
-
-def build_projection_metric(
-    unique_id: str,
-    projections: List[str],
-    reference: Optional[str] = None,
-) -> QCMetric:
-    """Adopt the projection figures so none is published unreferenced.
-
-    Without this metric the mean, start and end projection images reach the
-    results asset with no reviewer surface.
-
-    Parameters
-    ----------
-    unique_id : str
-        Plane identifier used to prefix the metric name.
-    projections : list of str
-        Projection figure paths relative to the results root, in the order
-        they were written.
-    reference : str or None, optional
-        Path to the figure a reviewer should open first (the mean
-        projection), relative to the results root.
-
-    Returns
-    -------
-    QCMetric
-        The projection-images metric.
-    """
-    return _metric(
-        name=f"{unique_id} Projection images",
-        evaluation=EVALUATION_PROJECTIONS,
-        value={"projections": list(projections)},
-        description=(
-            "Mean projection of the analysed movie block, plus the start and end "
-            "stability windows when the movie is long enough for them. Status is always "
-            "PASS (no automatic threshold). Review the images for field-of-view shifts, "
-            "clipping or obvious registration failure."
-        ),
-        status=Status.PASS,
         reference=reference,
     )
 
@@ -523,7 +466,6 @@ def collect_metrics(
     unique_id: str,
     metrics: dict,
     references: Dict[str, str],
-    projections: List[str],
     short_movie_mode: bool = False,
     zdrift: Optional[dict] = None,
 ) -> List[QCMetric]:
@@ -543,8 +485,6 @@ def collect_metrics(
     references : dict
         Figure paths relative to the results root, keyed by the ``REF_*``
         constants. A missing key yields a metric with no reference.
-    projections : list of str
-        Projection figure paths relative to the results root.
     short_movie_mode : bool, optional
         Whether the movie was too short for the stability-window metrics.
     zdrift : dict or None, optional
@@ -561,7 +501,6 @@ def collect_metrics(
         build_epilepsy_metric(unique_id, metrics, references.get(REF_EPILEPSY)),
         build_event_detection_metric(unique_id, metrics, short_movie_mode=short_movie_mode),
         build_pixel_distribution_metric(unique_id, metrics, references.get(REF_INTENSITY_HIST)),
-        build_projection_metric(unique_id, projections, references.get(REF_PROJECTIONS)),
     ]
     if not short_movie_mode:
         collected.append(

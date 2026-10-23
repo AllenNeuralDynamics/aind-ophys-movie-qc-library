@@ -21,9 +21,17 @@ REFERENCES = {
     qc.REF_INTENSITY_HIST: f"{UNIQUE_ID}/movie_qc/{UNIQUE_ID}_registered_physio_intensity_hist.png",
     qc.REF_COMBINED: f"{UNIQUE_ID}/movie_qc/{UNIQUE_ID}_roi_and_photon_metrics.png",
     qc.REF_ZDRIFT: f"{UNIQUE_ID}/movie_qc/{UNIQUE_ID}_registered_zdrift.png",
-    qc.REF_PROJECTIONS: f"{UNIQUE_ID}/movie_qc/{UNIQUE_ID}_registered_mean_projection_image.png",
 }
-PROJECTIONS = [REFERENCES[qc.REF_PROJECTIONS]]
+
+# The (evaluation, type) tags of every metric, spelled out as the portal groups them.
+GROUP_CONTRACT = {
+    f"{UNIQUE_ID} Intensity stability": ("Intensity Drift", "Operational QC"),
+    f"{UNIQUE_ID} Epilepsy probability": ("Epilepsy", "Operational QC"),
+    f"{UNIQUE_ID} Event detection statistics": ("Event detection statistics", "Informational"),
+    f"{UNIQUE_ID} Pixel value distribution": ("Pixel Saturation", "Operational QC"),
+    f"{UNIQUE_ID} Photon detection statistics": ("Photon detection statistics", "Informational"),
+    f"{UNIQUE_ID} Z-drift Analysis": ("Z-drift", "Operational QC"),
+}
 
 
 class TestAutomaticStatuses(unittest.TestCase):
@@ -52,7 +60,6 @@ class TestMetricSharedContract(unittest.TestCase):
             unique_id=UNIQUE_ID,
             metrics=fixtures.raw_metrics(),
             references=REFERENCES,
-            projections=PROJECTIONS,
             short_movie_mode=False,
             zdrift=fixtures.zdrift_result(),
         )
@@ -62,7 +69,13 @@ class TestMetricSharedContract(unittest.TestCase):
         for metric in self.metrics:
             with self.subTest(metric=metric.name):
                 self.assertIn("evaluation", metric.tags)
-                self.assertEqual(metric.tags["type"], qc.METRIC_TYPE)
+                self.assertIn("type", metric.tags)
+
+    def test_groups_and_types_follow_the_agreed_contract(self) -> None:
+        """Photon and event statistics are informational, every other group is
+        operational QC."""
+        actual = {m.name: (m.tags["evaluation"], m.tags["type"]) for m in self.metrics}
+        self.assertEqual(actual, GROUP_CONTRACT)
 
     def test_every_metric_seeds_a_status(self) -> None:
         """An empty status_history is rejected at construction."""
@@ -96,7 +109,6 @@ class TestMetricSharedContract(unittest.TestCase):
         expected = {
             f"{UNIQUE_ID} Epilepsy probability": REFERENCES[qc.REF_EPILEPSY],
             f"{UNIQUE_ID} Pixel value distribution": REFERENCES[qc.REF_INTENSITY_HIST],
-            f"{UNIQUE_ID} Projection images": REFERENCES[qc.REF_PROJECTIONS],
             f"{UNIQUE_ID} Intensity stability": REFERENCES[qc.REF_INTENSITY_PLOT],
             f"{UNIQUE_ID} Photon detection statistics": REFERENCES[qc.REF_COMBINED],
             f"{UNIQUE_ID} Z-drift Analysis": REFERENCES[qc.REF_ZDRIFT],
@@ -111,6 +123,21 @@ class TestMetricSharedContract(unittest.TestCase):
         """Duplicate names in one document are unreadable in the portal."""
         names = [metric.name for metric in self.metrics]
         self.assertEqual(len(names), len(set(names)))
+
+    def test_descriptions_state_the_status_thresholds(self) -> None:
+        """A description that quotes a cut-off must quote the one the status uses."""
+        descriptions = {metric.name: metric.description for metric in self.metrics}
+        quoted = {
+            "Intensity stability": "Pass below 10%, Pending below 20%, Fail at 20% or more.",
+            "Pixel value distribution": (
+                "Pass below 800 saturated pixels, Pending from 800 to 999, Fail at 1000 or more."
+            ),
+            "Epilepsy probability": "Pass if zero, otherwise Fail;",
+            "Z-drift Analysis": "Pass within 10 um, otherwise Fail.",
+        }
+        for suffix, phrase in quoted.items():
+            with self.subTest(metric=suffix):
+                self.assertIn(phrase, descriptions[f"{UNIQUE_ID} {suffix}"])
 
 
 class TestIndividualMetrics(unittest.TestCase):
@@ -192,17 +219,25 @@ class TestIndividualMetrics(unittest.TestCase):
         metric = qc.build_zdrift_metric(UNIQUE_ID, fixtures.zdrift_result(z_drift_um=-25.0))
         self.assertEqual(metric.status_history[0].status, Status.FAIL)
 
+    def test_zdrift_threshold_is_inclusive_and_symmetric(self) -> None:
+        """A drift of exactly 10 um passes, in either direction."""
+        for z_drift_um, expected in (
+            (10.0, Status.PASS),
+            (-10.0, Status.PASS),
+            (10.25, Status.FAIL),
+            (-10.25, Status.FAIL),
+        ):
+            with self.subTest(z_drift_um=z_drift_um):
+                metric = qc.build_zdrift_metric(
+                    UNIQUE_ID, fixtures.zdrift_result(z_drift_um=z_drift_um)
+                )
+                self.assertEqual(metric.status_history[0].status, expected)
+
     def test_zdrift_values_exclude_the_per_plane_arrays(self) -> None:
         """start_corr/end_corr are long and live in the raw metrics dump."""
         values = qc.zdrift_values(fixtures.zdrift_result())
         self.assertNotIn("start_corr", values)
         self.assertNotIn("end_corr", values)
-
-    def test_projection_metric_lists_the_figures_it_adopts(self) -> None:
-        """The metric references every projection figure that was written."""
-        metric = qc.build_projection_metric(UNIQUE_ID, PROJECTIONS, PROJECTIONS[0])
-        self.assertEqual(metric.value["projections"], PROJECTIONS)
-        self.assertEqual(metric.status_history[0].status, Status.PASS)
 
 
 class TestCollectMetrics(unittest.TestCase):
@@ -219,13 +254,12 @@ class TestCollectMetrics(unittest.TestCase):
             unique_id=UNIQUE_ID,
             metrics=fixtures.raw_metrics(),
             references=REFERENCES,
-            projections=PROJECTIONS,
             **options,
         )
 
-    def test_full_run_emits_seven_metrics(self) -> None:
-        """A full-length run emits all seven metrics."""
-        self.assertEqual(len(self._collect()), 7)
+    def test_full_run_emits_six_metrics(self) -> None:
+        """A full-length run emits all six metrics."""
+        self.assertEqual(len(self._collect()), 6)
 
     def test_short_movie_drops_intensity_and_photon_metrics(self) -> None:
         """Their inputs were never computed, so they must not be emitted."""
@@ -234,6 +268,14 @@ class TestCollectMetrics(unittest.TestCase):
         self.assertNotIn(f"{UNIQUE_ID} Photon detection statistics", names)
         self.assertIn(f"{UNIQUE_ID} Epilepsy probability", names)
         self.assertIn(f"{UNIQUE_ID} Pixel value distribution", names)
+
+    def test_short_movie_metrics_keep_their_group_and_type(self) -> None:
+        """Gating drops metrics but never changes the group or type of the rest."""
+        for metric in self._collect(short_movie_mode=True):
+            with self.subTest(metric=metric.name):
+                self.assertEqual(
+                    (metric.tags["evaluation"], metric.tags["type"]), GROUP_CONTRACT[metric.name]
+                )
 
     def test_no_zstack_drops_the_zdrift_metric(self) -> None:
         """Without a z-stack there is nothing for a reviewer to assess."""
@@ -246,7 +288,6 @@ class TestCollectMetrics(unittest.TestCase):
             unique_id=UNIQUE_ID,
             metrics=fixtures.raw_metrics(),
             references={},
-            projections=[],
             short_movie_mode=True,
         )
         self.assertTrue(all(metric.reference is None for metric in metrics))
@@ -266,7 +307,6 @@ class TestQualityControlDocument(unittest.TestCase):
             unique_id=UNIQUE_ID,
             metrics=fixtures.raw_metrics(),
             references=REFERENCES,
-            projections=PROJECTIONS,
             zdrift=fixtures.zdrift_result(),
         )
         return qc.build_quality_control(metrics)
@@ -290,7 +330,7 @@ class TestQualityControlDocument(unittest.TestCase):
             payload = json.loads(written.read_text())
             self.assertIn("describedBy", payload)
             reloaded = QualityControl.model_validate_json(written.read_text())
-        self.assertEqual(len(reloaded.metrics), 7)
+        self.assertEqual(len(reloaded.metrics), 6)
 
 
 if __name__ == "__main__":
