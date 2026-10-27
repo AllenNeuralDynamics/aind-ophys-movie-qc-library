@@ -31,7 +31,9 @@ One task covers one plane. `run()`:
 4. Computes the statistics and renders the figures — intensity drift, epilepsy
    probability, SNR and d-prime, pixel-value distribution, ROI segmentation and
    photon flux, projection images.
-5. Measures z-drift when a matching local z-stack is mounted.
+5. Measures z-drift when `<plane>_z_stack_local.h5` is mounted, where `<plane>`
+   is the plane id from step 2 (`VISp_0_registered.h5` gives `VISp_0`). Without
+   it, z-drift is skipped with a warning.
 6. Writes the raw metrics dump, a full `processing.json` and a full
    `quality_control.json`.
 
