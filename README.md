@@ -26,8 +26,7 @@ One task covers one plane. `run()`:
    derives the plane id from its filename.
 3. Resolves the frame rate, preferring the rate motion correction recorded on
    the registered movie's `metadata` dataset, then the acquisition metadata,
-   then `--frame_rate`. There is no default: a wrong frame rate silently rescales the
-   epilepsy event widths and every per-second photon statistic.
+   then `--frame_rate`, otherwise raises `ValueError`.
 4. Computes the statistics and renders the figures — intensity drift, epilepsy
    probability, SNR and d-prime, pixel-value distribution, ROI segmentation and
    photon flux, projection images.
