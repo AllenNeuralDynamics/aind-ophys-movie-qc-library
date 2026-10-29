@@ -1,406 +1,41 @@
-import argparse
-import json
-import logging
-import os
-import shutil
-from datetime import datetime as dt
+"""Movie-QC computation and figure rendering.
+
+These routines produce the values reviewers read in QC Portal, so their
+numerics are held fixed. Coverage-omitted - they need a real movie to exercise.
+"""
+
 from pathlib import Path
-from typing import Union
+from typing import Sequence, Tuple, Union
 
 import h5py
 import matplotlib.patches as patches
 import matplotlib.pyplot as plt
 import numpy as np
-from aind_data_schema.core.quality_control import (Modality, QCEvaluation,
-                                                   QCMetric, QCStatus, Stage,
-                                                   Status)
-from image_utils import combine_images_vertically  # Adjust import if needed
-from local_z_stack import LocalZStack
 from matplotlib.gridspec import GridSpec
 from oasis.functions import deconvolve as oasis_deconvolve
-from PIL import Image
 from scipy import ndimage
 from scipy.linalg import LinAlgError
 from scipy.stats import gaussian_kde
 from skimage import filters, measure
-
-SCANIMAGE_MAXIMUM_PIXEL_BRIGHTNESS_LEVEL = 18423
 
 # Frames skipped at each end of the movie when extracting stability windows.
 IGNORE_FRAMES = 300
 # Frames averaged at each end, offset by IGNORE_FRAMES from the absolute ends
 # of the movie.
 NB_BORDER_FRAMES_TO_AVG = 200
-# Minimum movie length (frames) required to run the full QC. Below this, the
-# capsule enters "short-movie mode" and skips the start/end stability window
+# Minimum movie length (frames) required to run the full QC. Below this the
+# run enters "short-movie mode" and skips the start/end stability window
 # slicing along with everything it gates: intensity drift, basic ROI
-# segmentation, photon flux per-ROI, d-prime, and the corresponding QC
-# evaluations.
+# segmentation, photon flux per-ROI, d-prime, and the corresponding metrics.
 SHORT_MOVIE_MODE_THRESHOLD = 2 * (IGNORE_FRAMES + NB_BORDER_FRAMES_TO_AVG) + 1
 
+# Frames per bin when subsampling the whole movie for the intensity trace.
+FULL_LENGTH_BINNING = 500
 
-def save_qc_evaluation_to_file(
-    evaluation: QCEvaluation, output_dir: Path, filename: str
-) -> None:
-    """Save a QC evaluation to a JSON file.
+# Dataset name inside the registered-movie HDF5.
+MOVIE_DATASET = "data"
 
-    Parameters
-    ----------
-    evaluation : QCEvaluation
-        The QC evaluation to save
-    output_dir : Path
-        The output directory
-    filename : str
-        The filename (without extension) to save to
-
-    Returns
-    -------
-    None
-    """
-
-    filepath = output_dir / f"{filename}_evaluation.json"
-    with open(filepath, "w", encoding="utf-8") as f:
-        json.dump(json.loads(evaluation.model_dump_json()), f, indent=4)
-
-
-def save_qc_metric_to_file(metric: QCMetric, output_dir: Path, filename: str) -> None:
-    """Save a QC metric to a JSON file."""
-    filepath = output_dir / f"{filename}.json"
-    with open(filepath, "w", encoding="utf-8") as f:
-        json.dump(json.loads(metric.model_dump_json()), f, indent=4)
-
-
-def write_qc_evaluation(
-    output_dir: Path,
-    unique_id: str,
-    metrics: dict,
-    z_drift: bool = False,
-    short_movie_mode: bool = False,
-) -> None:
-    """Write QC evaluations grouped by functional purpose.
-
-    Parameters
-    ----------
-    output_dir: Path
-        output directory
-    unique_id: str
-        unique_id number
-    metrics: dict
-        dictionary containing all calculated metrics
-    z_drift: bool
-        whether z-drift metrics were calculated
-    short_movie_mode: bool
-        whether the capsule is running in short-movie mode (movie shorter than
-        ``SHORT_MOVIE_MODE_THRESHOLD``). When True, the intensity-drift
-        and photon-detection evaluations are skipped, and the d-prime fields
-        are omitted from the SNR/event-detection evaluation.
-
-    Returns
-    -------
-    None
-    """
-
-    # 1. Intensity Change Evaluation
-    if not short_movie_mode:
-        intensity_change = metrics.get("percent_change_intensity", 0.0)
-        if abs(intensity_change) >= 20:
-            status = Status.FAIL
-        elif abs(intensity_change) >= 10:
-            status = Status.PENDING
-        else:
-            status = Status.PASS
-
-        intensity_metric = QCMetric(
-            name="Intensity stability",
-            description=(
-                "This metric quantifies the percent change in mean pixel intensity from the start to the end of the movie. "
-                "It is calculated as 100 * (end_mean - start_mean) / start_mean, where start_mean and end_mean are the average pixel values in the first and last 200 frames (ignoring the first and last 300 frames). "
-                "A large negative value indicates photobleaching or instability."
-                "Status is automatically assigned: PASS if |change| < 10%, PENDING if 10% <= |change| < 20%, FAIL if |change| >= 20%. "
-                "If the status is not PASS, review the intensity progression plot for abrupt drops or trends."
-            ),
-            reference=str(
-                f"{unique_id}/movie_qc/{unique_id}_registered_physio_intensity_plot.png"
-            ),
-            value=f"{float(intensity_change):.2f}%",
-            status_history=[
-                QCStatus(evaluator="Automated", timestamp=dt.now(), status=status)
-            ],
-        )
-
-        intensity_evaluation = QCEvaluation(
-            modality=Modality.POPHYS,
-            stage=Stage.PROCESSING,
-            name="Op. QC: Intensity Drift",
-            description="Analysis of intensity changes throughout the movie",
-            allow_failed_metrics=False,
-            metrics=[intensity_metric],
-            tags=["Operational QC"]
-        )
-        save_qc_evaluation_to_file(
-            intensity_evaluation, output_dir, f"{unique_id}_intensity_change"
-        )
-
-    # 2. Epilepsy Probability Evaluation
-    epilepsy_prob = metrics.get("epilepsy_probability", 0)
-    if epilepsy_prob > 0:
-        epilepsy_status = Status.FAIL
-    else:
-        epilepsy_status = Status.PASS
-
-    epilepsy_metric = QCMetric(
-        name="Epilepsy probability",
-        description=(
-            "This metric estimates the probability of epileptiform activity in the movie using deconvolution and event detection. "
-            "The signal is denoised and events are detected; events with prominence > 10 and width between 0.1 and 0.3 seconds are considered epileptic. "
-            "The metric is the fraction of such events among all detected events."
-            "Status is automatically assigned: PASS if probability is 0, FAIL otherwise. "
-            "If FAIL, inspect the event plot for clusters of large, brief events."
-        ),
-        reference=str(
-            f"{unique_id}/movie_qc/{unique_id}_registered_epilepsy_probability.png"
-        ),
-        status_history=[
-            QCStatus(evaluator="Automated", timestamp=dt.now(), status=epilepsy_status)
-        ],
-        value=float(epilepsy_prob),
-    )
-
-    epilepsy_evaluation = QCEvaluation(
-        modality=Modality.POPHYS,
-        stage=Stage.PROCESSING,
-        name="Op. QC Epilepsy",
-        description="Detection of potential epileptic activity in the recording",
-        allow_failed_metrics=False,
-        metrics=[epilepsy_metric],
-    )
-    save_qc_evaluation_to_file(
-        epilepsy_evaluation, output_dir, f"{unique_id}_epilepsy_probability"
-    )
-
-    # Merge SNR and Event Detection (D-prime) Evaluations into a single QCMetric.
-    # D-prime fields are omitted on the short-movie skip path so a reviewer can
-    # tell "not computed" apart from a real zero.
-    snr_dprime_values = {
-        "SNR Mean": float(metrics.get("simple_snr_mean", 0.0)),
-        "SNR Median": float(metrics.get("simple_snr_med", 0.0)),
-        "SNR Standard Deviation": float(metrics.get("simple_snr_std", 0.0)),
-    }
-    if not short_movie_mode:
-        snr_dprime_values["Median ROI D-prime"] = float(
-            metrics.get("median_rois_dprime", 0.0)
-        )
-        snr_dprime_values["ROI D-prime Standard Deviation"] = float(
-            metrics.get("std_rois_dprime", 0.0)
-        )
-    merged_snr_dprime_metric = QCMetric(
-        name="Event detection statistics",
-        description=(
-            "This metric combines signal-to-noise ratio (SNR) and event detection (d-prime) statistics."
-            "SNR is calculated as the mean pixel value divided by the standard deviation for each frame, summarized as mean, median, and standard deviation across the movie. "
-            "Higher SNR indicates better image quality."
-            "D-prime is calculated for each ROI using photon flux and neuropil estimates, following Wilt et al. (2013), and summarized as the median and standard deviation. "
-            "Higher d-prime values indicate better event detectability."
-            "Status is always PASS (no automatic threshold). Review low SNR or d-prime values for possible issues with signal quality or event detection."
-        ),
-        value=snr_dprime_values,
-        status_history=[
-            QCStatus(evaluator="Automated", timestamp=dt.now(), status=Status.PASS)
-        ],
-    )
-    merged_snr_dprime_evaluation = QCEvaluation(
-        modality=Modality.POPHYS,
-        stage=Stage.PROCESSING,
-        name="Event detection statistics",
-        description="Combined SNR and event detection (d-prime) metrics for image quality and event detection performance.",
-        allow_failed_metrics=False,
-        metrics=[merged_snr_dprime_metric],
-    )
-    save_qc_evaluation_to_file(
-        merged_snr_dprime_evaluation, output_dir, f"{unique_id}_snr_event_detection"
-    )
-
-    # 4+5+6. Saturated, Low Intensity, and Intensity Percentiles Evaluation (fully merged for table output)
-    saturated_pixels = metrics.get("nb_saturated_pixels", 0)
-    if saturated_pixels >= 1000:
-        sat_status = Status.FAIL
-    elif saturated_pixels >= 800:
-        sat_status = Status.PENDING
-    else:
-        sat_status = Status.PASS
-
-    low_pixels = metrics.get("nb_low_pixels", 0)
-    low_pixels_perc = metrics.get("nb_low_pixels_perc", 0.0)
-    percentile_lower = float(metrics.get("percentile_lower", 0.0))
-    percentile_upper = float(metrics.get("percentile_upper", 0.0))
-
-    merged_pixel_values = {
-        "Saturated Pixels": int(saturated_pixels),
-        "Low Intensity Pixels": int(low_pixels),
-        "Low Intensity Pixels Percentage": float(low_pixels_perc),
-        "Intensity Percentile Lower (5th)": percentile_lower,
-        "Intensity Percentile Upper (95th)": percentile_upper,
-    }
-    merged_pixel_metric = QCMetric(
-        name="Pixel value distribution",
-        description=(
-            "This metric summarizes the distribution of pixel values in the movie, including the number of saturated pixels (at or above max range), low intensity pixels (at or below min range), and the 5th/95th percentiles. "
-            "Saturated and low pixels are counted in the first 500 frames."
-            "Status is automatically assigned: PASS if saturated pixels < 800, PENDING if 800 <= saturated < 1000, FAIL if >= 1000. "
-            "If not PASS, review the intensity histogram for evidence of clipping or poor dynamic range."
-        ),
-        value=merged_pixel_values,
-        status_history=[
-            QCStatus(evaluator="Automated", timestamp=dt.now(), status=sat_status)
-        ],
-        reference=str(
-            f"{unique_id}/movie_qc/{unique_id}_registered_physio_intensity_hist.png"
-        ),
-    )
-    merged_pixel_evaluation = QCEvaluation(
-        modality=Modality.POPHYS,
-        stage=Stage.PROCESSING,
-        name="Op. QC: Pixel Saturation",
-        description="Analysis of saturated, low intensity, and percentile pixel metrics in the recording (table-friendly)",
-        allow_failed_metrics=False,
-        metrics=[merged_pixel_metric],
-        tags=["Operational QC"]
-    )
-    save_qc_evaluation_to_file(
-        merged_pixel_evaluation,
-        output_dir,
-        f"{unique_id}_saturated_low_percentile_pixels",
-    )
-
-    if not short_movie_mode:
-        # Paths to the two images to combine
-        seg_img_path = os.path.join(
-            output_dir, f"{unique_id}_registered_basic_segmentation_image.png"
-        )
-        poisson_img_path = os.path.join(
-            output_dir, f"{unique_id}_registered_physio_poisson_plot.png"
-        )
-        combined_img_path = os.path.join(
-            output_dir, f"{unique_id}_roi_and_photon_metrics.png"
-        )
-
-        # Read images and stack vertically using PIL utility
-        seg_img = Image.open(seg_img_path)
-        poisson_img = Image.open(poisson_img_path)
-        combined_img = combine_images_vertically([seg_img, poisson_img])
-        combined_img.save(combined_img_path)
-
-        merged_values = {
-            "Mean ROI Intensity": float(metrics.get("mean_rois_intensity", 0.0)),
-            "ROI Segmentation Threshold": float(metrics.get("rois_threshold", 0.0)),
-            "Median ROI Neuropil Sum": float(
-                metrics.get("median_sum_rois_neuropil", 0.0)
-            ),
-            "Photon Gain": float(metrics.get("photon_gain")),
-            "Photon Offset": float(metrics.get("photon_offset")),
-            "Background Noise": float(metrics.get("background_noise")),
-            "Photon Flux Median": float(
-                metrics.get("photon_flux_median_per_pixel_per_frame")
-            ),
-            "Mean Photons per ROI per Frame": float(
-                metrics.get("mean_photons_per_roi_per_frame")
-            ),
-            "Mean Photons per ROI per Second": float(
-                metrics.get("mean_photons_per_roi_per_s")
-            ),
-            "Mean Photons per Neuropil per Second": float(
-                metrics.get("mean_photons_per_neuropil_per_s")
-            ),
-        }
-        merged_metric = QCMetric(
-            name="Photon detection statistics",
-            description=(
-                "This metric summarizes photon detection."
-                "ROI segmentation is performed using Otsu thresholding on a high-pass filtered median image from the start of the movie. "
-                "Mean ROI intensity, segmentation threshold, and median neuropil sum are reported."
-                "Photon gain and offset are estimated by fitting the variance vs. mean relationship for non-saturated pixels. "
-                "Photon flux and background noise are derived from these parameters. "
-                "Photon statistics are reported as mean/median values per ROI and neuropil, per frame and per second."
-                "Status is always PASS (no automatic threshold). Review for outliers or unexpected values."
-            ),
-            value=merged_values,
-            reference=combined_img_path,
-            status_history=[
-                QCStatus(evaluator="Automated", timestamp=dt.now(), status=Status.PASS)
-            ],
-        )
-        merged_evaluation = QCEvaluation(
-            modality=Modality.POPHYS,
-            stage=Stage.PROCESSING,
-            name="Photon detection statistics",
-            description="Analysis of ROI detection, photon-related parameters, and neuropil photon counts, with combined plot.",
-            allow_failed_metrics=False,
-            metrics=[merged_metric],
-        )
-        save_qc_evaluation_to_file(
-            merged_evaluation, output_dir, f"{unique_id}_roi_photon_neuropil_metrics"
-        )
-
-    if z_drift:
-        # 12. Z-drift Evaluation
-        zdrift_qc_threshold = 10  # TODO: where is the best place to put this threshold?
-        zdrift_metrics = []
-        zdrift = metrics.get("zdrift", -100)
-        if zdrift == -100:
-            zdrift_status = Status.PENDING
-        else:
-            zdrift_um = float(zdrift["z_drift_um"])
-            if (
-                abs(zdrift_um) <= zdrift_qc_threshold
-            ):  # Low drift TODO: expose this threshold somewhere
-                zdrift_status = Status.PASS
-            else:
-                zdrift_status = Status.FAIL
-
-        zdrift_metrics_dict = {
-            "z_drift_um": zdrift_um,
-            "start_frame": int(zdrift["start_frame"]),
-            "end_frame": int(zdrift["end_frame"]),
-            "z_drift_frame": int(zdrift["z_drift_frame"]),
-            "start_frame_corr": round(zdrift["start_frame_corr"], 3),
-            "end_frame_corr": round(zdrift["end_frame_corr"], 3),
-            "nb_of_loops": int(zdrift["local_zstack_parameters"]["nb_of_loops"]),
-            "nb_of_planes": int(zdrift["local_zstack_parameters"]["nb_of_planes"]),
-            "z_spacing_um": round(zdrift["local_zstack_parameters"]["z_spacing_um"], 2),
-            "total_z_distance": round(
-                zdrift["local_zstack_parameters"]["total_z_distance"], 2
-            ),
-        }
-
-        zdrift_metrics = QCMetric(
-            name=f"{unique_id} Z-drift Analysis",
-            description="Z-drift analysis metrics",
-            value=zdrift_metrics_dict,
-            reference=str(f"{unique_id}/movie_qc/{unique_id}_registered_zdrift.png"),
-            status_history=[
-                QCStatus(
-                    evaluator="Automated", timestamp=dt.now(), status=zdrift_status
-                )
-            ],
-        )
-
-        zdrift_evaluation = QCEvaluation(
-            modality=Modality.POPHYS,
-            stage=Stage.PROCESSING,
-            name=f"Op. QC: Z-drift",
-            description=f"Analysis of z-drift in the recording, with threshold {zdrift_qc_threshold} um",
-            allow_failed_metrics=False,
-            metrics=[zdrift_metrics],
-            tags=['Operational QC']
-        )
-
-        save_qc_evaluation_to_file(
-            zdrift_evaluation, output_dir, f"{unique_id}_z_drift"
-        )
-
-    print(
-        f"Successfully created QC evaluations groups with _evaluation.json suffix for: {unique_id}"
-    )
+REGISTERED_MOVIE_GLOB = "*registered.h5"
 
 
 def get_and_plot_epilepsy_probability(
@@ -409,31 +44,34 @@ def get_and_plot_epilepsy_probability(
     signal_threshold: float = 10.0,
     min_width: float = 0.1,
     max_width: float = 0.3,
-):
+) -> Tuple[float, plt.Figure]:
     """Get the probability of epilepsy in this physio movie.
 
-    Parameters:
-    -----------
-    cropped_video: np.ndarray
+    Parameters
+    ----------
+    cropped_video : np.ndarray
         The video to analyze
-    frame_rate: float
+    frame_rate : float
         Frames per second of the signal
-    signal_threshold: float
+    signal_threshold : float
         A bound above which events are tagged as epileptic events
-    min_width: float
+    min_width : float
         Lower bound on the widths within which events are tagged as epileptic
-    max_width: float
+    max_width : float
         Upper bound on the widths within which events are tagged as epileptic
-
 
     Returns
     -------
     float
-        the probability of epilepsy.
+        The probability of epilepsy.
     matplotlib.figure.Figure
         A figure showing the epilepsy plot.
-    """
 
+    Raises
+    ------
+    Exception
+        If the point-density estimate for the event scatter does not converge.
+    """
     avg_frames = np.mean(cropped_video, axis=(1, 2)).astype("double")
 
     perc_diff = -100 * (1 - avg_frames / avg_frames.mean())
@@ -447,9 +85,7 @@ def get_and_plot_epilepsy_probability(
     )
     nb_epileptic_events = len(
         prominence_data[
-            (prominence_data > signal_threshold)
-            & (widths > min_width)
-            & (widths < max_width)
+            (prominence_data > signal_threshold) & (widths > min_width) & (widths < max_width)
         ]
     )
 
@@ -482,21 +118,21 @@ def get_spike_prominence_and_width(
     spike_events: np.ndarray,
     frame_rate: float,
     spike_threshold: float = 0.05,
-):
+) -> Tuple[np.ndarray, np.ndarray]:
     """Get the local prominence and width of each spike in a calcium trace.
 
-    Local prominence is a measure of the strength of the spike relative to other spikes
-    nearest to it.
+    Local prominence is a measure of the strength of the spike relative to
+    other spikes nearest to it.
 
     Parameters
     ----------
-    denoised_signal: np.ndarray
+    denoised_signal : np.ndarray
         The denoised fluorescence signal
-    spike_events: np.ndarray
+    spike_events : np.ndarray
         Discretized deconvolved neural activity (spikes)
-    frame_rate: float
+    frame_rate : float
         Frames per second of the signal, used to convert width to seconds
-    spike_threshold: float
+    spike_threshold : float
         A bound below which spikes will be thrown out
 
     Returns
@@ -506,14 +142,13 @@ def get_spike_prominence_and_width(
     np.ndarray
         An array of widths
     """
-
     event_idxs = np.where(spike_events > spike_threshold)[0]
     filtered_signal = denoised_signal[event_idxs]
 
     _prominences = []
     _widths = []
 
-    for idx, event_idx in enumerate(event_idxs):
+    for event_idx in event_idxs:
         # Prominence calculation
         local_amplitude = denoised_signal[event_idx]
         local_diff = local_amplitude - filtered_signal
@@ -523,9 +158,8 @@ def get_spike_prominence_and_width(
         if not pre_spike_idxs.any():
             pre_spike_idx = 0
         else:
-            pre_spike_idx = np.max(
-                pre_spike_idxs
-            )  # Nearest spike larger than local spike on left
+            # Nearest spike larger than the local spike, on the left
+            pre_spike_idx = np.max(pre_spike_idxs)
 
         # Minimum signal between prev large spike and current spike
         pre_spikes = denoised_signal[pre_spike_idx:event_idx]
@@ -535,15 +169,14 @@ def get_spike_prominence_and_width(
         if not post_peak_idxs.any():
             post_peak_idx = len(denoised_signal)
         else:
-            post_peak_idx = np.min(
-                post_peak_idxs
-            )  # Nearest spike larger than local spike on right
+            # Nearest spike larger than the local spike, on the right
+            post_peak_idx = np.min(post_peak_idxs)
 
         # Minimum signal between post large spike and current spike
         post_spikes = denoised_signal[event_idx:post_peak_idx]
         post_min = np.min(post_spikes)
 
-        local_min = np.max([pre_min, post_min])  # TODO: Should be min here?
+        local_min = np.max([pre_min, post_min])
         local_prominence = local_amplitude - local_min
         _prominences.append(local_prominence)
 
@@ -554,9 +187,7 @@ def get_spike_prominence_and_width(
         else:
             pre_half_idx = np.min(len(pre_spikes) - pre_half_idxs)
 
-        post_half_idxs = np.where(post_spikes < local_amplitude - local_prominence / 2)[
-            0
-        ]
+        post_half_idxs = np.where(post_spikes < local_amplitude - local_prominence / 2)[0]
         if not post_half_idxs.any():
             post_half_idx = len(post_spikes)
         else:
@@ -569,19 +200,22 @@ def get_spike_prominence_and_width(
 
 
 def plot_intensity_histogram(
-    cropped_video: np.ndarray, min_range: int, max_range: int, log_scale: bool = True
-):
+    cropped_video: np.ndarray,
+    min_range: int,
+    max_range: int,
+    log_scale: bool = True,
+) -> plt.Figure:
     """Obtain a plot of the intensity histogram.
 
     Parameters
     ----------
-    cropped_video: np.ndarray
+    cropped_video : np.ndarray
         The video to plot
-    min_range: int
+    min_range : int
         The minimum pixel value to consider
-    max_range: int
+    max_range : int
         The maximum pixel value to consider
-    log_scale: bool
+    log_scale : bool
         Whether to plot the histogram on a log scale
 
     Returns
@@ -589,7 +223,6 @@ def plot_intensity_histogram(
     matplotlib.figure.Figure
         A figure showing the intensity histogram
     """
-
     fig = plt.figure()
     cropped_video = cropped_video.flatten().copy()
     plt.hist(
@@ -607,31 +240,30 @@ def plot_intensity_histogram(
 
 
 def plot_projection_image(
-    cropped_video: np.ndarray, min_range: int = 1, max_range: int = 99
-):
+    cropped_video: np.ndarray,
+    min_range: int = 1,
+    max_range: int = 99,
+) -> plt.Figure:
     """Create a projection image of the video.
 
     Parameters
     ----------
-    cropped_video: np.ndarray
+    cropped_video : np.ndarray
         The video to plot
-    min_range: int
-        The minimum pixel value to consider
-    max_range: int
-        The maximum pixel value to consider
+    min_range : int
+        The minimum percentile to consider
+    max_range : int
+        The maximum percentile to consider
 
     Returns
     -------
     matplotlib.figure.Figure
         A figure showing the projection image
     """
-
     fig = plt.figure()
     image_project = np.mean(cropped_video, axis=0)
     list_pixel_limits = np.percentile(image_project.flatten(), [min_range, max_range])
-    plt.imshow(
-        image_project, cmap="gray", vmin=list_pixel_limits[0], vmax=list_pixel_limits[1]
-    )
+    plt.imshow(image_project, cmap="gray", vmin=list_pixel_limits[0], vmax=list_pixel_limits[1])
     plt.axis("off")
     return fig
 
@@ -641,18 +273,18 @@ def get_and_plot_basic_segmentation(
     min_object_size: int = 100,
     max_object_size: int = 300,
     sigma_segmentation: int = 30,
-):
+) -> Tuple[dict, plt.Figure]:
     """Get basic segmentation data and plot the results.
 
     Parameters
     ----------
-    cropped_video: np.ndarray
+    cropped_video : np.ndarray
         The video to analyze
-    min_object_size: int
+    min_object_size : int
         The minimum size of an object to consider
-    max_object_size: int
+    max_object_size : int
         The maximum size of an object to consider
-    sigma_segmentation: int
+    sigma_segmentation : int
         The sigma value to use in the segmentation
 
     Returns
@@ -662,7 +294,6 @@ def get_and_plot_basic_segmentation(
     matplotlib.figure.Figure
         A figure showing the basic segmentation
     """
-
     # We use a median to remove calcium events for F0
     background_image = np.median(cropped_video, axis=0)
 
@@ -684,7 +315,7 @@ def get_and_plot_basic_segmentation(
     )
     plt.axis("off")
 
-    # Label connected components and filter objects larger than 100 pixels
+    # Label connected components and filter objects by size
     label_image = measure.label(binary_image)
     roi_intensities = []
     roi_sum = []
@@ -705,7 +336,12 @@ def get_and_plot_basic_segmentation(
             neuropil_sum.append(np.sum(segmented_area_pixels_neuropil))
 
             rect = patches.Rectangle(
-                (x1, y1), x2 - x1, y2 - y1, fill=False, edgecolor="red", linewidth=1
+                (x1, y1),
+                x2 - x1,
+                y2 - y1,
+                fill=False,
+                edgecolor="red",
+                linewidth=1,
             )
             plt.gca().add_patch(rect)
 
@@ -722,8 +358,7 @@ def get_and_plot_basic_segmentation(
 
 
 def plot_poisson_curve(photon_gain_parameters: dict) -> plt.Figure:
-    """
-    Obtain a plot showing Poisson characteristics of the signal.
+    """Obtain a plot showing Poisson characteristics of the signal.
 
     Parameters
     ----------
@@ -735,9 +370,10 @@ def plot_poisson_curve(photon_gain_parameters: dict) -> plt.Figure:
     matplotlib.figure.Figure
         A figure showing the Poisson characteristics of the signal.
     """
-
     h, xedges, yedges = np.histogram2d(
-        photon_gain_parameters["var"], photon_gain_parameters["mean"], bins=(200, 200)
+        photon_gain_parameters["var"],
+        photon_gain_parameters["mean"],
+        bins=(200, 200),
     )
     extent = [yedges[0], yedges[-1], xedges[0], xedges[-1]]
 
@@ -763,11 +399,8 @@ def plot_poisson_curve(photon_gain_parameters: dict) -> plt.Figure:
     return fig
 
 
-def plot_avg_intensity_progression(
-    cropped_video: np.ndarray, binning: int
-) -> plt.Figure:
-    """
-    Obtain a plot showing the average intensity over time.
+def plot_avg_intensity_progression(cropped_video: np.ndarray, binning: int) -> plt.Figure:
+    """Obtain a plot showing the average intensity over time.
 
     Parameters
     ----------
@@ -795,10 +428,11 @@ def plot_avg_intensity_progression(
 
 
 def get_saturation_metrics(
-    cropped_video: np.ndarray, min_pixel_range: int, max_pixel_range: int
+    cropped_video: np.ndarray,
+    min_pixel_range: int,
+    max_pixel_range: int,
 ) -> dict:
-    """
-    Return the number of pixels falling outside the usual dynamic range.
+    """Return the number of pixels falling outside the usual dynamic range.
 
     Parameters
     ----------
@@ -820,9 +454,7 @@ def get_saturation_metrics(
     nb_undersat_pixels = (cropped_video.flatten() <= min_pixel_range).sum()
     nb_undersat_pixels = nb_undersat_pixels / float(cropped_video.shape[0])
     nb_undersat_pixels_perc = (
-        100
-        * nb_undersat_pixels
-        / float(cropped_video.shape[1] * cropped_video.shape[2])
+        100 * nb_undersat_pixels / float(cropped_video.shape[1] * cropped_video.shape[2])
     )
 
     return {
@@ -832,11 +464,8 @@ def get_saturation_metrics(
     }
 
 
-def get_percent_change_intensity(
-    start_section: np.ndarray, end_section: np.ndarray
-) -> float:
-    """
-    Return the percent change in total intensity throughout the physio movie.
+def get_percent_change_intensity(start_section: np.ndarray, end_section: np.ndarray) -> float:
+    """Return the percent change in mean pixel intensity across the movie.
 
     Parameters
     ----------
@@ -848,7 +477,7 @@ def get_percent_change_intensity(
     Returns
     -------
     float
-        A float corresponding to the loss in total intensity as a percentage.
+        The change in mean pixel intensity, as a percentage of the start.
     """
     start_mean = np.mean(start_section, axis=(0, 1, 2))
     end_mean = np.mean(end_section, axis=(0, 1, 2))
@@ -858,8 +487,7 @@ def get_percent_change_intensity(
 
 
 def get_simple_snr_metrics(cropped_video: np.ndarray) -> dict:
-    """
-    Compute metrics related to the signal to noise level for the images.
+    """Compute metrics related to the signal-to-noise level for the images.
 
     Parameters
     ----------
@@ -871,7 +499,6 @@ def get_simple_snr_metrics(cropped_video: np.ndarray) -> dict:
     dict
         A dictionary of metrics
     """
-
     # Simple SNR - https://en.wikipedia.org/wiki/Signal-to-noise_ratio_(imaging)
     simple_snr_array = cropped_video.mean(axis=(1, 2)) / cropped_video.std(axis=(1, 2))
 
@@ -882,11 +509,8 @@ def get_simple_snr_metrics(cropped_video: np.ndarray) -> dict:
     }
 
 
-def get_percentile_metrics(
-    cropped_video: np.ndarray, perc_min: int, perc_max: int
-) -> dict:
-    """
-    Compute metrics related to the range of the signal.
+def get_percentile_metrics(cropped_video: np.ndarray, perc_min: int, perc_max: int) -> dict:
+    """Compute metrics related to the range of the signal.
 
     Parameters
     ----------
@@ -909,61 +533,65 @@ def get_percentile_metrics(
 
 
 def subsample_and_crop_video(
-    data_pointer: Union[h5py._hl.dataset.Dataset, np.ndarray],
+    data_pointer: Union[h5py.Dataset, np.ndarray],
     subsample: int,
-    crop: tuple[int, int],
+    crop: Sequence[int],
     start_frame: int = 0,
     end_frame: int = -1,
 ) -> np.ndarray:
-    """
-    Subsample and crop a video, cache results. Also functions as a data_pointer load.
+    """Subsample and crop a video. Also functions as a data_pointer load.
 
     Parameters
     ----------
-    data_pointer : h5py._hl.dataset.Dataset or np.ndarray
+    data_pointer : h5py.Dataset or np.ndarray
         The data pointer to the video data.
     subsample : int
         An integer specifying the amount of subsampling (1 = full movie).
-    crop : tuple[int, int]
-        A tuple (px_y, px_x) specifying the number of pixels to remove.
+    crop : sequence of int
+        ``(px_y, px_x)`` specifying the number of pixels to remove per edge.
     start_frame : int, optional
         The index of the first desired frame, by default 0.
     end_frame : int, optional
-        The index of the last desired frame, by default -1.
+        Exclusive end index of the frame range, by default -1.
 
     Returns
     -------
     np.ndarray
         The resultant array.
+
+    Raises
+    ------
+    NotImplementedError
+        If ``data_pointer`` is neither an HDF5 dataset nor an ndarray.
     """
-
-    if not isinstance(data_pointer, (h5py._hl.dataset.Dataset, np.ndarray)):
+    if not isinstance(data_pointer, (h5py.Dataset, np.ndarray)):
         raise NotImplementedError("Data pointer must be a h5py dataset or numpy array.")
-    else:
-        _shape = data_pointer.shape
-        px_y_start, px_x_start = crop
-        px_y_end = _shape[1] - px_y_start
-        px_x_end = _shape[2] - px_x_start
 
-        if start_frame == _shape[0] - 1 and (end_frame == -1 or end_frame == _shape[0]):
-            cropped_video = data_pointer[
-                start_frame::subsample, px_y_start:px_y_end, px_x_start:px_x_end
-            ]
-        else:
-            cropped_video = data_pointer[
-                start_frame:end_frame:subsample,
-                px_y_start:px_y_end,
-                px_x_start:px_x_end,
-            ]
+    _shape = data_pointer.shape
+    px_y_start, px_x_start = crop
+    px_y_end = _shape[1] - px_y_start
+    px_x_end = _shape[2] - px_x_start
+
+    if start_frame == _shape[0] - 1 and (end_frame == -1 or end_frame == _shape[0]):
+        cropped_video = data_pointer[
+            start_frame::subsample, px_y_start:px_y_end, px_x_start:px_x_end
+        ]
+    else:
+        cropped_video = data_pointer[
+            start_frame:end_frame:subsample,
+            px_y_start:px_y_end,
+            px_x_start:px_x_end,
+        ]
 
     return cropped_video
 
 
 def convert_intensity_into_photon_flux(
-    intensities: np.ndarray, photon_offset: float, photon_gain: float
+    intensities: np.ndarray,
+    photon_offset: float,
+    photon_gain: float,
 ) -> np.ndarray:
-    """
-    Convert intensity values into photon flux.
+    """Convert intensity values into photon flux.
 
     Parameters
     ----------
@@ -991,21 +619,30 @@ def get_photon_gain_parameters(
     perc_min: int = 3,
     perc_max: int = 90,
 ) -> dict:
-    """Photon Gain.
+    """Compute parameters related to the physio signal's photon gain.
 
-    Compute a variety of parameters related to the physio signal's gain.
+    Parameters
+    ----------
+    cropped_video : np.ndarray
+        The video to analyze.
+    max_pixel_range : int
+        The maximum pixel value to consider.
+    perc_min : int
+        Min value between 0-100 used in filtering based on percentile.
+    perc_max : int
+        Max value between 0-100 used in filtering based on percentile.
 
-    Args:
-        cropped_video (np.ndarray): The video to analyze.
-        max_pixel_range (int): The maximum pixel value to consider.
-        perc_min (int): Min value between 0-100 used in filtering based on percentile.
-        perc_max (int): Max value between 0-100 used in filtering based on percentile.
+    Returns
+    -------
+    dict
+        A dictionary of parameters related to the physio signal, used for both
+        plots and metrics.
 
-    Returns:
-        dict: A dictionary of parameters related to the physio signal.
-        Useful in making plots and metrics.
+    Raises
+    ------
+    Exception
+        If the variance-versus-mean least-squares fit does not converge.
     """
-
     # Remove saturated pixels
     idxs_not_saturated = np.where(cropped_video.max(axis=0).flatten() < max_pixel_range)
 
@@ -1053,14 +690,14 @@ def get_dprime_indicator(
     decay_time: float,
     dff_single_event_size: float,
 ) -> np.ndarray:
-    """
-    Calculate the d-prime indicator for event detection.
+    """Calculate the d-prime indicator for event detection.
 
-    This original formula was introduced in Wilt et al, 2013.
-    Default values of decay_time and dff_single_event_size are for Gcamp6f.
-    We improved Wilt et al formula to correct for the presence of non-responsive
-    background neuropil, assuming a fixed DF/F given by the indicator. Note that if
-    neuropil is null we end up with dff_single_event_size as the correcting factor is 1.
+    This original formula was introduced in Wilt et al, 2013. Default values
+    of decay_time and dff_single_event_size are for GCaMP6f. We improved the
+    Wilt et al formula to correct for the presence of non-responsive
+    background neuropil, assuming a fixed DF/F given by the indicator. Note
+    that if neuropil is null we end up with dff_single_event_size, as the
+    correcting factor is 1.
 
     Parameters
     ----------
@@ -1071,7 +708,7 @@ def get_dprime_indicator(
     decay_time : float
         The estimated 1/2 decay time of the event reporter (s).
     dff_single_event_size : float
-        The estimated DF/F event size of the event reporter for single events (au).
+        The estimated DF/F event size of the reporter for single events (au).
 
     Returns
     -------
@@ -1079,9 +716,7 @@ def get_dprime_indicator(
         The d-prime indicator values.
     """
     corrected_dff_single_event_size = (
-        dff_single_event_size
-        * baseline_photon_flux
-        / (baseline_photon_flux + neuropil_photon_flux)
+        dff_single_event_size * baseline_photon_flux / (baseline_photon_flux + neuropil_photon_flux)
     )
     d_prime = (
         np.sqrt((baseline_photon_flux + neuropil_photon_flux) * decay_time / 2)
@@ -1097,8 +732,8 @@ def save_figure_to_storage(
     root_filename: str,
     image_name: str,
     dpi: int = 120,
-) -> None:
-    """Saves QC images to the file system.
+) -> Path:
+    """Save a QC figure to the file system and close it.
 
     Parameters
     ----------
@@ -1115,200 +750,83 @@ def save_figure_to_storage(
 
     Returns
     -------
-    None
+    pathlib.Path
+        The path written, so the caller can record it as a QC reference.
     """
-    if not storage_path.exists():
-        storage_path.mkdir(parents=True)
+    storage_path = Path(storage_path)
+    storage_path.mkdir(parents=True, exist_ok=True)
     filepath = storage_path / f"{root_filename}_{image_name}.png"
 
     figure.savefig(filepath, dpi=dpi)
     plt.close(figure)
+    return filepath
 
 
-def make_output_directory(output_dir: Path, unique_id: str) -> str:
-    """Creates the output directory if it does not exist
-
-    Parameters
-    ----------
-    output_dir: Path
-        output directory
-    unique_id: str
-        unique_id number
-
-    Returns
-    -------
-    output_dir: str
-        output directory
-    """
-    output_dir = output_dir / unique_id
-    output_dir.mkdir(exist_ok=True)
-    output_dir = output_dir / "movie_qc"
-    output_dir.mkdir(exist_ok=True)
-
-    return output_dir
-
-
-def parse_args() -> argparse.Namespace:
-    """Parse command line arguments
-
-    Returns
-    -------
-    argparse.Namespace
-        parsed arguments
-    """
-    parser = argparse.ArgumentParser(description="Raw movie QC")
-    parser.add_argument(
-        "-i",
-        "--input-dir",
-        type=str,
-        help="Regular expression to input hdf5 movie. The first one found is picked",
-        default="../data",
-    )
-    parser.add_argument(
-        "-o", "--output-dir", type=str, help="Output directory", default="/results/"
-    )
-
-    # This is to constrain the analysis to a subset of frames
-    # to reduce cost and increase speed
-    parser.add_argument(
-        "--start_frame",
-        type=int,
-        default=1,
-        help=("Start of movie block to use for main analysis"),
-    )
-
-    parser.add_argument(
-        "--end_frame",
-        type=int,
-        default=10000,
-        help=("End of movie block to use for main analysis"),
-    )
-
-    parser.add_argument(
-        "--crop",
-        type=list,
-        default=(30, 30),
-        help=(
-            "cropped area of movie to use for analysis. Useful to remove"
-            " edge effects"
-        ),
-    )
-
-    parser.add_argument(
-        "--max_pixel_range",
-        type=int,
-        default=SCANIMAGE_MAXIMUM_PIXEL_BRIGHTNESS_LEVEL,
-        help=("This is the pixel value above which we consider saturation occurred."),
-    )
-
-    parser.add_argument(
-        "--min_pixel_range",
-        type=int,
-        default=0,
-        help=(
-            "This is the pixel value below which we consider under-saturation occurred."
-        ),
-    )
-
-    parser.add_argument(
-        "--decay_time",
-        type=float,
-        default=0.2,
-        help=("This is the estimated 1/2 decay time of your event reporter (s)."),
-    )
-
-    parser.add_argument(
-        "--frame_rate",
-        type=float,
-        default=0,
-        help=("Optional argument to provide frame rate if not available."),
-    )
-
-    parser.add_argument(
-        "--dff_single_event_size",
-        type=float,
-        default=0.15,
-        help=(
-            "This is the estimated DF/F event size of your event"
-            " reporter for single events (au)."
-        ),
-    )
-
-    return parser.parse_args()
-
-
-def write_legacy_movie_qc_metrics(
-    output_dir: Path, unique_id: str, metrics: dict
-) -> None:
-    """Write only the legacy QC metrics currently expected by the aggregator.
-
-    This function writes only the 2 specific metrics that the current aggregator's
-    create_movie_qc_evaluations function looks for:
-    - epilepsy_probability_metric
-    - physio_intensity_plot_metric
+def make_output_directory(output_dir: Path, unique_id: str) -> Path:
+    """Create this plane's ``<unique_id>/movie_qc`` output directory.
 
     Parameters
     ----------
-    output_dir: Path
-        output directory
-    unique_id: str
-        unique_id number
-    metrics: dict
-        dictionary containing all calculated metrics
+    output_dir : pathlib.Path
+        The results root.
+    unique_id : str
+        Plane identifier.
 
     Returns
     -------
-    None
+    pathlib.Path
+        The created directory.
     """
+    plane_dir = Path(output_dir) / unique_id / "movie_qc"
+    plane_dir.mkdir(parents=True, exist_ok=True)
+    return plane_dir
 
-    # Only create the 2 metrics that the current aggregator expects
 
-    # 1. Epilepsy probability metric (matches current aggregator pattern)
-    epilepsy_prob = metrics.get("epilepsy_probability", 0)
-    if epilepsy_prob > 0:
-        epilepsy_status = Status.FAIL
-    else:
-        epilepsy_status = Status.PASS
+def plot_zdrift(zdrift: dict, save_imgs: dict) -> plt.Figure:
+    """Render the 3x2 z-drift figure.
 
-    metric = QCMetric(
-        name=f"{unique_id} Epilepsy Probability",
-        description="Automated assessment of epileptic activity probability",
-        reference=str(
-            f"{unique_id}/movie_qc/{unique_id}_registered_epilepsy_probability.png"
-        ),
-        status_history=[
-            QCStatus(evaluator="Automated", timestamp=dt.now(), status=epilepsy_status)
-        ],
-        value=float(epilepsy_prob),
+    Parameters
+    ----------
+    zdrift : dict
+        The z-drift result from ``LocalZStack.get_z_drift``.
+    save_imgs : dict
+        The start/end movie and z-stack plane images from the same call.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+        The z-drift figure.
+    """
+    fig = plt.figure(figsize=(10, 15))
+    gs = GridSpec(3, 2, height_ratios=[1, 1, 0.5], figure=fig)
+
+    for yi, image_segment in enumerate(["start", "end"]):
+        for xi, image_type in enumerate(["image", "zstack_plane"]):
+            key = f"{image_segment}_{image_type}"
+            ax = fig.add_subplot(gs[yi, xi])
+            img = save_imgs[key]
+            ax.imshow(
+                img,
+                cmap="gray",
+                vmin=np.percentile(img.flatten(), 1),
+                vmax=np.percentile(img.flatten(), 99),
+            )
+            ax.set_title(key)
+
+    ax_corr = fig.add_subplot(gs[2, :])
+    start_idx = zdrift["start_frame"]
+    end_idx = zdrift["end_frame"]
+
+    ax_corr.plot(zdrift["start_corr"], label="start_corr")
+    ax_corr.plot(zdrift["end_corr"], label="end_corr")
+    ax_corr.legend()
+    ax_corr.axvline(start_idx, color="k", linestyle="--")
+    ax_corr.axvline(end_idx, color="k", linestyle="--")
+    ax_corr.set_title(
+        f"Start frame {start_idx}, end frame {end_idx}, " f"zdrift = {zdrift['z_drift_um']} um"
     )
-    save_qc_metric_to_file(
-        metric, output_dir, f"{unique_id}_registered_epilepsy_probability_metric"
-    )
+    ax_corr.set_xlabel("Z plane")
+    ax_corr.set_ylabel("Correlation")
 
-    # 2. Physio intensity plot metric (matches current aggregator pattern)
-    intensity_change = metrics.get("percent_change_intensity", 0.0)
-    if abs(intensity_change) >= 20:
-        status = Status.FAIL
-    elif abs(intensity_change) >= 10:
-        status = Status.PENDING
-    else:
-        status = Status.PASS
-
-    metric = QCMetric(
-        name=f"{unique_id} Physio Intensity Plot",
-        description="Percent change in intensity from start to end of movie",
-        reference=str(
-            f"{unique_id}/movie_qc/{unique_id}_registered_physio_intensity_plot.png"
-        ),
-        value=float(intensity_change),
-        status_history=[
-            QCStatus(evaluator="Automated", timestamp=dt.now(), status=status)
-        ],
-    )
-    save_qc_metric_to_file(
-        metric, output_dir, f"{unique_id}_registered_physio_intensity_plot_metric"
-    )
-
-    print(
-        f"Successfully created 2 legacy QC metrics for aggregator compatibility: {unique_id}"
-    )
+    fig.tight_layout()
+    return fig
