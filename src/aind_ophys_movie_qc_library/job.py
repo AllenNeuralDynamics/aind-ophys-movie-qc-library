@@ -212,7 +212,7 @@ def _write_figures(
     settings: MovieQCSettings,
     windows: dict,
     metrics: dict,
-    epilepsy_figure: Figure,
+    epilepsy_figure: Optional[Figure],
     context: dict,
 ) -> dict:
     """Render and save every figure, returning results-relative references.
@@ -227,7 +227,7 @@ def _write_figures(
         The metrics dict; supplies the photon-gain parameters for the Poisson
         figure, and the segmentation, photon-flux and d-prime results are
         merged into it here.
-    epilepsy_figure : matplotlib.figure.Figure
+    epilepsy_figure : matplotlib.figure.Figure or None
         The epilepsy figure, already produced with the probability.
     context : dict
         Run context; reads ``output_dir``, ``base_file``, ``unique_id``,
@@ -250,7 +250,8 @@ def _write_figures(
     paths = {}
     # The projection figures are written but no QC metric references them.
     _save(analysis.plot_projection_image(windows["small_cropped"]), "mean_projection_image")
-    paths[qc.REF_EPILEPSY] = _save(epilepsy_figure, "epilepsy_probability")
+    if epilepsy_figure is not None:
+        paths[qc.REF_EPILEPSY] = _save(epilepsy_figure, "epilepsy_probability")
 
     segmentation_path = None
     if not windows["short_movie_mode"]:

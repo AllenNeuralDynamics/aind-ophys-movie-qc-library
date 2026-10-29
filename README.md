@@ -112,8 +112,8 @@ registered movie's stem:
 - `<base>_metrics.json` — the raw metrics dump, minus the bulky per-pixel
   arrays.
 - `<base>_mean_projection_image.png`, `<base>_physio_intensity_plot.png`,
-  `<base>_physio_intensity_hist.png`, `<base>_physio_poisson_plot.png` and
-  `<base>_epilepsy_probability.png`.
+  `<base>_physio_intensity_hist.png`, `<base>_physio_poisson_plot.png`, and
+  `<base>_epilepsy_probability.png` when the deconvolved signal is not flat.
 - Long movies only: `<base>_start_projection_image.png`,
   `<base>_end_projection_image.png`, `<base>_basic_segmentation_image.png` and
   `<plane>_roi_and_photon_metrics.png`.
