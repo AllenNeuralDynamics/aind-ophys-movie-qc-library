@@ -4,9 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aind-ophys-movie-qc-library"
-description = "Generated from aind-library-template"
+description = "Registered-movie quality control for AIND ophys pipelines"
 license = "MIT"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.13"
 authors = [
     {name = "Allen Institute for Neural Dynamics"}
 ]
@@ -17,7 +17,23 @@ readme = "README.md"
 version = "0.1.0"
 
 dependencies = [
+    "aind-data-schema==2.9.0",
+    "aind-data-schema-models==6.2.0",
+    "aind-pophys-metadata @ git+https://github.com/AllenNeuralDynamics/aind-pophys-metadata.git@v0.3.1",
+    "log-schema[cloudwatch] @ git+https://github.com/AllenNeuralDynamics/log-schema.git@f09685e#subdirectory=python",
+    "oasis-deconv==0.3.2",
+    "scipy==1.15.3",
+    "numpy==2.2.6",
+    "h5py==3.16.0",
+    "matplotlib==3.10.9",
+    "scikit-image==0.25.2",
+    "pillow==12.3.0",
+    "pydantic==2.11.10",
+    "pydantic-settings==2.14.2",
 ]
+
+[project.urls]
+Repository = "https://github.com/AllenNeuralDynamics/aind-ophys-movie-qc-library"
 
 [dependency-groups]
 dev = [
@@ -34,7 +50,7 @@ dev = [
 where = ["src"]
 
 [tool.black]
-line-length = 79
+line-length = 100
 target_version = ['py310']
 exclude = '''
 
@@ -56,7 +72,12 @@ exclude = '''
 '''
 
 [tool.coverage.run]
-omit = ["*__init__*"]
+omit = [
+    "*__init__*",
+    "*/analysis.py",
+    "*/local_z_stack.py",
+    "*/job.py",
+]
 source = ["aind_ophys_movie_qc_library", "tests"]
 
 [tool.coverage.report]
@@ -69,7 +90,7 @@ exclude_lines = [
 fail_under = 100
 
 [tool.isort]
-line_length = 79
+line_length = 100
 profile = "black"
 skip = [".conda", ".venv"]
 
